@@ -167,22 +167,22 @@ for idx, disc in enumerate(disciplines):
         # Display Heatmap Table
         st.dataframe(results_df.style.map(highlight_bottlenecks, subset=week_labels), use_container_width=True)
         
-        # Prepare Chart Data
+       # Prepare Chart Data
+        # التعديل هنا: استخدام 'weeks' (التواريخ الفعلية) بدلاً من 'week_labels' (النصوص) للترتيب الزمني
         chart_data = pd.DataFrame({
-            "Week": week_labels,
+            "Date": weeks, 
             "Variance (Shortage/Surplus)": var_list,
             "Demand": dem_list,
             "Capacity": cap_list
         })
         
-        # --- التعديل هنا: إضافة عمود لتحديد اللون بناءً على القيمة ---
+        # تحديد اللون بناءً على القيمة
         chart_data["Color"] = np.where(chart_data["Variance (Shortage/Surplus)"] >= 0, "#2ca02c", "#d62728")
         
         # Display Interactive Charts
         st.markdown("#### 📉 Weekly Variance Chart (Dips below 0 indicate bottlenecks)")
-        # استخدام المتغيرات x و y و color للتحكم الدقيق بالرسم
-        st.bar_chart(chart_data, x="Week", y="Variance (Shortage/Surplus)", color="Color") 
+        # نستخدم عمود Date للمحور السيني (X) لضمان الترتيب الزمني
+        st.bar_chart(chart_data, x="Date", y="Variance (Shortage/Surplus)", color="Color") 
         
         st.markdown("#### 📈 Demand vs Capacity Trend")
-        # استرجاع Week كـ Index لتعمل رسمة الخطوط بشكل صحيح كما في نسختك
-        st.line_chart(chart_data.set_index("Week")[["Demand", "Capacity"]])
+        st.line_chart(chart_data.set_index("Date")[["Demand", "Capacity"]])
