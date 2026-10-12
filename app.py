@@ -18,6 +18,12 @@ if SHEET_GID is not None:
 
 DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
 
+# Working week: Sunday to Thursday (Friday & Saturday are the weekend)
+# numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
+NP_WEEKMASK = "1111001"
+PD_WEEKMASK = "Sun Mon Tue Wed Thu"
+HOURS_PER_DAY = 8
+
 
 # ----------------------------------------------------------------------
 # 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
@@ -74,12 +80,12 @@ st.sidebar.markdown("Set the number of available engineers:")
 disciplines = ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]
 default_engineers = [16, 10, 5, 5, 12]
 engineers = {}
-capacities = {}
+capacities = {}  # daily capacity (hours per working day)
 efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(f"{disc} Engineers", value=default, min_value=0)
-    capacities[disc] = engineers[disc] * 40 * efficiency
+    capacities[disc] = engineers[disc] * HOURS_PER_DAY * efficiency
 
 # ----------------------------------------------------------------------
 # 4. Project table (temporary edits only - not saved back to the sheet)
@@ -95,21 +101,22 @@ edited_df = st.data_editor(
 )
 
 # ----------------------------------------------------------------------
-# 5. Calculation Engine
+# 5. Calculation Engine (daily, Sunday - Thursday)
 # ----------------------------------------------------------------------
 st.markdown("---")
-st.subheader("🔥 Bottleneck Analysis & Executive Dashboard")
+st.subheader("🔥 Daily Bottleneck Analysis & Executive Dashboard")
 
 col1, col2 = st.columns(2)
 with col1:
     start_timeline = st.date_input("Timeline Start Date:", datetime.date(2026, 9, 20))
 with col2:
-    num_weeks = st.slider("Number of Weeks to Analyze:", 5, 20, 10)
+    num_weeks = st.slider("Number of Weeks to Analyze:", 1, 12, 4)
 
-weeks = [start_timeline + datetime.timedelta(days=7 * i) for i in range(num_weeks)]
-week_labels = [w.strftime("%d-%b") for w in weeks]
+num_days = num_weeks * 5
+days = [d.date() for d in pd.bdate_range(start=start_timeline, periods=num_days, freq="C", weekmask=PD_WEEKMASK)]
+day_labels = [d.strftime("%a %d-%b") for d in days]
 
-demand = {disc: [0.0] * num_weeks for disc in disciplines}
+demand = {disc: [0.0] * num_days for disc in disciplines}
 
 for idx, row in edited_df.iterrows():
     if pd.isnull(row.get("Start Date")) or pd.isnull(row.get("End Date")):
@@ -118,7 +125,8 @@ for idx, row in edited_df.iterrows():
     s_date = row["Start Date"]
     e_date = row["End Date"]
 
-    workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask="1111100")
+    # Total working days of the project (Sun-Thu only)
+    workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)
     if workdays_total <= 0:
         continue
 
@@ -134,14 +142,9 @@ for idx, row in edited_df.iterrows():
 
         daily_rate = total_hrs / workdays_total
 
-        for i, w_start in enumerate(weeks):
-            w_end = w_start + datetime.timedelta(days=6)
-            overlap_start = max(s_date, w_start)
-            overlap_end = min(e_date, w_end)
-
-            if overlap_start <= overlap_end:
-                overlap_days = np.busday_count(overlap_start, overlap_end + datetime.timedelta(days=1), weekmask="1111100")
-                demand[disc][i] += daily_rate * overlap_days
+        for i, day in enumerate(days):
+            if s_date <= day <= e_date:
+                demand[disc][i] += daily_rate
 
 # ----------------------------------------------------------------------
 # 6. Display Charts and Tables
@@ -157,7 +160,7 @@ def highlight_bottlenecks(val):
 
 for idx, disc in enumerate(disciplines):
     with tabs[idx]:
-        st.markdown(f"### {disc} Team Analysis")
+        st.markdown(f"### {disc} Team Analysis (Daily)")
 
         results_df = pd.DataFrame({
             "Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Shortage/Surplus)"],
@@ -165,49 +168,57 @@ for idx, disc in enumerate(disciplines):
 
         var_list, dem_list, cap_list = [], [], []
 
-        for i, w_label in enumerate(week_labels):
+        for i, d_label in enumerate(day_labels):
             dem = round(demand[disc][i], 1)
             cap = capacities[disc]
             var = round(cap - dem, 1)
 
-            results_df[w_label] = [dem, cap, var]
+            results_df[d_label] = [dem, cap, var]
             var_list.append(var)
             dem_list.append(dem)
             cap_list.append(cap)
 
+        # Bottleneck summary
+        short_days = [(day_labels[i], v) for i, v in enumerate(var_list) if v < 0]
+        if short_days:
+            worst = min(short_days, key=lambda x: x[1])
+            st.warning(f"⚠️ {len(short_days)} bottleneck day(s) out of {num_days}. Worst: **{worst[0]}** ({worst[1]:.2f} hrs).")
+        else:
+            st.success("✅ No bottlenecks in the selected period.")
+
         st.dataframe(
             results_df.style
-                .map(highlight_bottlenecks, subset=week_labels)
-                .format("{:.2f}", subset=week_labels),
+                .map(highlight_bottlenecks, subset=day_labels)
+                .format("{:.2f}", subset=day_labels),
             use_container_width=True,
         )
 
         chart_data = pd.DataFrame({
-            "Week": week_labels,
+            "Day": day_labels,
             "Variance (Shortage/Surplus)": var_list,
             "Demand": dem_list,
             "Capacity": cap_list,
         })
         chart_data["Color"] = np.where(chart_data["Variance (Shortage/Surplus)"] >= 0, "#2ca02c", "#d62728")
 
-        st.markdown("#### 📉 Weekly Variance Chart (Dips below 0 indicate bottlenecks)")
+        st.markdown("#### 📉 Daily Variance Chart (Dips below 0 indicate bottlenecks)")
         variance_chart = alt.Chart(chart_data).mark_bar().encode(
-            x=alt.X("Week:N", sort=week_labels, title="Week", axis=alt.Axis(labelAngle=-90)),
+            x=alt.X("Day:N", sort=day_labels, title="Day", axis=alt.Axis(labelAngle=-90)),
             y=alt.Y("Variance (Shortage/Surplus):Q", title="Variance (Shortage/Surplus)"),
             color=alt.Color("Color:N", scale=None),
-            tooltip=["Week", "Variance (Shortage/Surplus)", "Demand", "Capacity"],
+            tooltip=["Day", "Variance (Shortage/Surplus)", "Demand", "Capacity"],
         )
         st.altair_chart(variance_chart, use_container_width=True)
 
-        st.markdown("#### 📈 Demand vs Capacity Trend")
+        st.markdown("#### 📈 Daily Demand vs Capacity Trend")
         trend_df = chart_data.melt(
-            id_vars="Week", value_vars=["Demand", "Capacity"],
+            id_vars="Day", value_vars=["Demand", "Capacity"],
             var_name="Metric", value_name="Hours",
         )
         trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
-            x=alt.X("Week:N", sort=week_labels, title="Week", axis=alt.Axis(labelAngle=-90)),
+            x=alt.X("Day:N", sort=day_labels, title="Day", axis=alt.Axis(labelAngle=-90)),
             y=alt.Y("Hours:Q"),
             color=alt.Color("Metric:N"),
-            tooltip=["Week", "Metric", "Hours"],
+            tooltip=["Day", "Metric", "Hours"],
         )
         st.altair_chart(trend_chart, use_container_width=True)
