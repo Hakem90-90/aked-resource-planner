@@ -6,7 +6,7 @@ import io
 
 # 1. Page Configuration
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - AKED")
+st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
 st.info("💡 **Workflow Tip:** Upload your existing project CSV file to view the analysis. You can edit the data directly in the table below and then download the updated version to your computer for your next session.")
 
