@@ -8,7 +8,7 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - AKED")
+st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
 SHEET_ID = "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ"
 SHEET_GID = None  # None = first tab. Or put the tab's gid number, e.g. 123456789
