@@ -174,11 +174,15 @@ for idx, disc in enumerate(disciplines):
             "Demand": dem_list,
             "Capacity": cap_list
         })
-        chart_data.set_index("Week", inplace=True)
+        
+        # --- التعديل هنا: إضافة عمود لتحديد اللون بناءً على القيمة ---
+        chart_data["Color"] = np.where(chart_data["Variance (Shortage/Surplus)"] >= 0, "#2ca02c", "#d62728")
         
         # Display Interactive Charts
         st.markdown("#### 📉 Weekly Variance Chart (Dips below 0 indicate bottlenecks)")
-        st.bar_chart(chart_data["Variance (Shortage/Surplus)"], color="#d62728") 
+        # استخدام المتغيرات x و y و color للتحكم الدقيق بالرسم
+        st.bar_chart(chart_data, x="Week", y="Variance (Shortage/Surplus)", color="Color") 
         
         st.markdown("#### 📈 Demand vs Capacity Trend")
-        st.line_chart(chart_data[["Demand", "Capacity"]])
+        # استرجاع Week كـ Index لتعمل رسمة الخطوط بشكل صحيح كما في نسختك
+        st.line_chart(chart_data.set_index("Week")[["Demand", "Capacity"]])
