@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import io
+import altair as alt
 
 # 1. Page Configuration
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
@@ -105,31 +106,32 @@ demand = {disc: [0.0] * num_weeks for disc in disciplines}
 for idx, row in edited_df.iterrows():
     if pd.isnull(row.get('Start Date')) or pd.isnull(row.get('End Date')):
         continue
-        
+
     s_date = row['Start Date']
     e_date = row['End Date']
-    
+
     # Calculate Total Working Days (Excluding Fri/Sat)
     workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask='1111100')
-    if workdays_total <= 0: continue
+    if workdays_total <= 0:
+        continue
 
     for disc in disciplines:
         col_name = f"{disc} (Hrs)" if disc != "Arch Tech" else "Arch Tech (Hrs)"
         if col_name not in row or pd.isnull(row.get(col_name)):
             continue
-            
+
         try:
             total_hrs = float(row[col_name])
         except ValueError:
             continue
-            
+
         daily_rate = total_hrs / workdays_total
-        
+
         for i, w_start in enumerate(weeks):
             w_end = w_start + datetime.timedelta(days=6)
             overlap_start = max(s_date, w_start)
             overlap_end = min(e_date, w_end)
-            
+
             if overlap_start <= overlap_end:
                 overlap_days = np.busday_count(overlap_start, overlap_end + datetime.timedelta(days=1), weekmask='1111100')
                 demand[disc][i] += (daily_rate * overlap_days)
@@ -145,28 +147,33 @@ def highlight_bottlenecks(val):
 for idx, disc in enumerate(disciplines):
     with tabs[idx]:
         st.markdown(f"### {disc} Team Analysis")
-        
+
         results_df = pd.DataFrame({
             "Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Shortage/Surplus)"],
         })
-        
+
         var_list = []
         dem_list = []
         cap_list = []
-        
+
         for i, w_label in enumerate(week_labels):
             dem = round(demand[disc][i], 1)
             cap = capacities[disc]
             var = round(cap - dem, 1)
-            
+
             results_df[w_label] = [dem, cap, var]
             var_list.append(var)
             dem_list.append(dem)
             cap_list.append(cap)
-            
-        # Display Heatmap Table
-        st.dataframe(results_df.style.map(highlight_bottlenecks, subset=week_labels), use_container_width=True)
-        
+
+        # Display Heatmap Table (2 decimal places only)
+        st.dataframe(
+            results_df.style
+                .map(highlight_bottlenecks, subset=week_labels)
+                .format("{:.2f}", subset=week_labels),
+            use_container_width=True
+        )
+
         # Prepare Chart Data
         chart_data = pd.DataFrame({
             "Week": week_labels,
@@ -174,15 +181,27 @@ for idx, disc in enumerate(disciplines):
             "Demand": dem_list,
             "Capacity": cap_list
         })
-        
-        # --- التعديل هنا: إضافة عمود لتحديد اللون بناءً على القيمة ---
         chart_data["Color"] = np.where(chart_data["Variance (Shortage/Surplus)"] >= 0, "#2ca02c", "#d62728")
-        
-        # Display Interactive Charts
+
+        # Display Interactive Charts (chronological order enforced via sort=week_labels)
         st.markdown("#### 📉 Weekly Variance Chart (Dips below 0 indicate bottlenecks)")
-        # استخدام المتغيرات x و y و color للتحكم الدقيق بالرسم
-        st.bar_chart(chart_data, x="Week", y="Variance (Shortage/Surplus)", color="Color") 
-        
+        variance_chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X("Week:N", sort=week_labels, title="Week", axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("Variance (Shortage/Surplus):Q", title="Variance (Shortage/Surplus)"),
+            color=alt.Color("Color:N", scale=None),
+            tooltip=["Week", "Variance (Shortage/Surplus)", "Demand", "Capacity"]
+        )
+        st.altair_chart(variance_chart, use_container_width=True)
+
         st.markdown("#### 📈 Demand vs Capacity Trend")
-        # استرجاع Week كـ Index لتعمل رسمة الخطوط بشكل صحيح كما في نسختك
-        st.line_chart(chart_data.set_index("Week")[["Demand", "Capacity"]])
+        trend_df = chart_data.melt(
+            id_vars="Week", value_vars=["Demand", "Capacity"],
+            var_name="Metric", value_name="Hours"
+        )
+        trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
+            x=alt.X("Week:N", sort=week_labels, title="Week", axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("Hours:Q"),
+            color=alt.Color("Metric:N"),
+            tooltip=["Week", "Metric", "Hours"]
+        )
+        st.altair_chart(trend_chart, use_container_width=True)
