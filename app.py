@@ -8,7 +8,7 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - AKED")
+st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
 SHEET_ID = "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ"
 SHEET_GID = None  # None = first tab. Or put the tab's gid number, e.g. 123456789
@@ -45,6 +45,7 @@ def get_empty_template():
 @st.cache_data(ttl=60, show_spinner="Loading data from Google Sheet...")
 def load_from_gsheet(url):
     df = pd.read_csv(url)
+    df.columns = df.columns.astype(str).str.strip()
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
     df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
     for c in DATA_COLS:
@@ -111,12 +112,25 @@ edited_df = st.data_editor(
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
 
-NAME_COL = "Project / Contract Name"
+def find_name_col(df):
+    """Find the project-name column even if the header text differs slightly."""
+    skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
+    for c in df.columns:
+        low = str(c).lower()
+        if c not in skip and any(k in low for k in ("name", "project", "contract")):
+            return c
+    for c in df.columns:  # fallback: first text column
+        if c not in skip and df[c].dtype == object:
+            return c
+    return None
+
+
+NAME_COL = find_name_col(edited_df)
 
 
 def make_project_label(r):
-    name = r.get(NAME_COL)
-    name = str(name) if pd.notnull(name) else "Unnamed"
+    name = r.get(NAME_COL) if NAME_COL is not None else None
+    name = str(name).strip() if pd.notnull(name) and str(name).strip() != "" else "Unnamed"
     no = r.get("No.")
     if pd.notnull(no) and str(no).strip() != "":
         try:
@@ -145,11 +159,20 @@ else:
         for s, e in zip(gantt_df["Start"], gantt_df["End"])
     ]
     gantt_df = gantt_df.sort_values(["Start", "End"])
+    gantt_df["DateRange"] = [
+        f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}" for s, e in zip(gantt_df["Start"], gantt_df["End"])
+    ]
     project_order = gantt_df["Project"].tolist()
+
+    # Pad the right side of the axis so the date labels next to the last bars are not cut off
+    x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
+    span_days = (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days
+    x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
+    x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
         y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
-        x=alt.X("Start:T", title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
+        x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
         color=alt.Color("Project:N", legend=None),
         tooltip=[
@@ -161,14 +184,23 @@ else:
         ],
     )
 
-    layers = [bars]
+    # Start - End dates written right next to each bar
+    date_labels = alt.Chart(gantt_df).mark_text(
+        align="left", baseline="middle", dx=6, fontSize=11
+    ).encode(
+        y=alt.Y("Project:N", sort=project_order),
+        x=alt.X("EndPlus:T", scale=x_scale),
+        text="DateRange:N",
+    )
+
+    layers = [bars, date_labels]
 
     # Red dashed line for today (only if it falls inside the projects' date range)
     today = pd.Timestamp.today().normalize()
     if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
         today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
             color="red", strokeDash=[5, 4], strokeWidth=2
-        ).encode(x="Today:T")
+        ).encode(x=alt.X("Today:T", scale=x_scale))
         layers.append(today_rule)
 
     gantt_chart = alt.layer(*layers).properties(height=max(150, 34 * len(gantt_df) + 60))
