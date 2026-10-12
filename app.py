@@ -106,6 +106,76 @@ edited_df = st.data_editor(
 )
 
 # ----------------------------------------------------------------------
+# 4b. Project Timeline (Gantt Chart) - updates automatically from the table
+# ----------------------------------------------------------------------
+st.markdown("---")
+st.subheader("🗓️ Project Timeline (Gantt Chart)")
+
+NAME_COL = "Project / Contract Name"
+
+
+def make_project_label(r):
+    name = r.get(NAME_COL)
+    name = str(name) if pd.notnull(name) else "Unnamed"
+    no = r.get("No.")
+    if pd.notnull(no) and str(no).strip() != "":
+        try:
+            no = int(float(no))
+        except (ValueError, TypeError):
+            pass
+        return f"{no}. {name}"
+    return name
+
+
+gantt_df = edited_df.copy()
+gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
+gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
+gantt_df = gantt_df.dropna(subset=["Start", "End"])
+gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
+
+if gantt_df.empty:
+    st.info("No projects with valid start and end dates to display.")
+else:
+    hrs_cols = [c for c in DATA_COLS if c in gantt_df.columns]
+    gantt_df["Project"] = gantt_df.apply(make_project_label, axis=1)
+    gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)  # include the end day in the bar
+    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    gantt_df["WorkDays"] = [
+        int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+        for s, e in zip(gantt_df["Start"], gantt_df["End"])
+    ]
+    gantt_df = gantt_df.sort_values(["Start", "End"])
+    project_order = gantt_df["Project"].tolist()
+
+    bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
+        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
+        x=alt.X("Start:T", title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
+        x2="EndPlus:T",
+        color=alt.Color("Project:N", legend=None),
+        tooltip=[
+            alt.Tooltip("Project:N", title="Project"),
+            alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
+            alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
+            alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
+            alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
+        ],
+    )
+
+    layers = [bars]
+
+    # Red dashed line for today (only if it falls inside the projects' date range)
+    today = pd.Timestamp.today().normalize()
+    if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
+        today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
+            color="red", strokeDash=[5, 4], strokeWidth=2
+        ).encode(x="Today:T")
+        layers.append(today_rule)
+
+    gantt_chart = alt.layer(*layers).properties(height=max(150, 34 * len(gantt_df) + 60))
+    st.altair_chart(gantt_chart, use_container_width=True)
+    st.caption("Projects are sorted by start date. The red dashed line marks today. Hover over a bar for details.")
+
+# ----------------------------------------------------------------------
 # 5. Calculation Engine (daily, Sunday - Thursday)
 # ----------------------------------------------------------------------
 st.markdown("---")
