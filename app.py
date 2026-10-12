@@ -8,7 +8,7 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - ACKD")
+st.title("📊 Dynamic Engineering Resource Planner - AKED")
 
 SHEET_ID = "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ"
 SHEET_GID = None  # None = first tab. Or put the tab's gid number, e.g. 123456789
@@ -75,6 +75,11 @@ except Exception as e:
 # 3. Sidebar - Capacity Settings
 # ----------------------------------------------------------------------
 st.sidebar.header("⚙️ Team Capacity Settings")
+hours_per_day = st.sidebar.number_input(
+    "Working Hours per Day (per engineer)",
+    min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
+    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor",
+)
 st.sidebar.markdown("Set the number of available engineers:")
 
 disciplines = ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]
@@ -85,7 +90,7 @@ efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(f"{disc} Engineers", value=default, min_value=0)
-    capacities[disc] = engineers[disc] * HOURS_PER_DAY * efficiency
+    capacities[disc] = engineers[disc] * hours_per_day * efficiency
 
 # ----------------------------------------------------------------------
 # 4. Project table (temporary edits only - not saved back to the sheet)
