@@ -2,54 +2,66 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
+import io
 
-# 1. إعدادات الصفحة
+# 1. Page Configuration
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 نظام التخطيط الهندسي الديناميكي - آكد")
+st.title("📊 Dynamic Engineering Resource Planner - AKED")
 
-# 2. رابط Google Sheets (يجب أن يكون Anyone with the link - Editor)
-# قمنا بتحويل الرابط ليتم قراءته كملف CSV مباشر لتفادي تعقيدات المصادقة
-SHEET_ID = "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ"
-CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
+st.info("💡 **Workflow Tip:** Upload your existing project CSV file to view the analysis. You can edit the data directly in the table below and then download the updated version to your computer for your next session.")
 
-@st.cache_data(ttl=10) # تحديث البيانات كل 10 ثواني
-def load_data():
+# 2. File Upload Functionality
+uploaded_file = st.file_uploader("📂 Upload your Project Data (CSV format)", type=["csv"])
+
+# Function to provide an empty template if no file is uploaded
+def get_empty_template():
+    return pd.DataFrame({
+        "No.": [1],
+        "Project / Contract Name": ["Example Project"],
+        "Start Date": [datetime.date(2026, 9, 20)],
+        "End Date": [datetime.date(2026, 10, 20)],
+        "Arch Tech (Hrs)": [100.0],
+        "Structural (Hrs)": [80.0],
+        "Plumbing (Hrs)": [40.0],
+        "HVAC (Hrs)": [40.0],
+        "Electrical (Hrs)": [60.0]
+    })
+
+# Load data from uploaded file or use template
+if uploaded_file is not None:
     try:
-        df = pd.read_csv(CSV_URL)
-        # تنظيف وتجهيز التواريخ
-        df['Start Date'] = pd.to_datetime(df['Start Date'], errors='coerce').dt.date
-        df['End Date'] = pd.to_datetime(df['End Date'], errors='coerce').dt.date
-        return df
+        df_projects = pd.read_csv(uploaded_file)
+        # Clean and parse dates
+        df_projects['Start Date'] = pd.to_datetime(df_projects['Start Date'], errors='coerce').dt.date
+        df_projects['End Date'] = pd.to_datetime(df_projects['End Date'], errors='coerce').dt.date
+        st.success("✅ File uploaded successfully!")
     except Exception as e:
-        return pd.DataFrame()
+        st.error(f"Error reading file: {e}")
+        df_projects = get_empty_template()
+else:
+    df_projects = get_empty_template()
+    st.warning("⚠️ No file uploaded. Displaying template data. Please upload a CSV file or start editing below.")
 
-df_projects = load_data()
-
-if df_projects.empty:
-    st.error("⚠️ تعذر قراءة البيانات من Google Sheets. يرجى التأكد من أن الرابط متاح للعامة (Anyone with the link).")
-    st.stop()
-
-# 3. لوحة الإعدادات الجانبية (Capacity Settings)
-st.sidebar.header("⚙️ إعدادات سعة الفرق")
-st.sidebar.markdown("تحديد عدد المهندسين المتاحين حالياً:")
+# 3. Sidebar - Capacity Settings
+st.sidebar.header("⚙️ Team Capacity Settings")
+st.sidebar.markdown("Set the number of available engineers:")
 
 disciplines = ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]
 default_engineers = [16, 10, 5, 5, 12]
 engineers = {}
 capacities = {}
-efficiency = st.sidebar.slider("معامل الكفاءة والإنتاجية (%)", 50, 100, 80) / 100.0
+efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
-    # مطابقة أسماء الأعمدة في الشيت
     col_name = f"{disc} (Hrs)" if disc != "Arch Tech" else "Arch Tech (Hrs)"
-    engineers[disc] = st.sidebar.number_input(f"مهندسي {disc}", value=default, min_value=0)
+    engineers[disc] = st.sidebar.number_input(f"{disc} Engineers", value=default, min_value=0)
     capacities[disc] = engineers[disc] * 40 * efficiency
 
-# 4. واجهة إدخال البيانات (Table Editor)
-st.subheader("📋 سجل المشاريع وتوزيع الساعات")
-st.info("💡 لتحديث الساعات، يمكنك تعديل الجدول أدناه. (ملاحظة: في هذه النسخة المجانية المبسطة، التعديلات تتم برمجياً داخل التطبيق لتوليد التحليل، لحفظها نهائياً يفضل تحميلها كملف CSV أو إضافتها في الشيت مباشرة).")
+# 4. Data Editor (Editable Table)
+st.subheader("📋 Project Register & Hours Allocation (Editable)")
+st.markdown("You can edit the project details, add new rows, or delete existing ones directly in the table below.")
 
-# جدول قابل للتعديل
+# Interactive table
 edited_df = st.data_editor(
     df_projects,
     num_rows="dynamic",
@@ -57,67 +69,116 @@ edited_df = st.data_editor(
     hide_index=True
 )
 
-# 5. محرك الحسابات والخريطة الحرارية
-st.markdown("---")
-st.subheader("🔥 تحليل الاختناقات والسعة المتاحة (Heatmap)")
+# Function to convert df to csv for downloading
+@st.cache_data
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode('utf-8')
 
-start_timeline = st.date_input("تاريخ بداية التحليل:", datetime.date(2026, 9, 20))
-num_weeks = st.slider("عدد أسابيع التحليل:", 5, 20, 10)
+csv_data = convert_df_to_csv(edited_df)
+
+# Download button for the updated data
+st.download_button(
+    label="⬇️ Download Updated Project Data (CSV)",
+    data=csv_data,
+    file_name="Updated_Engineering_Resource_Data.csv",
+    mime="text/csv",
+    help="Click here to download your updated project list. You can upload this file next time you open the app."
+)
+
+# 5. Calculation Engine
+st.markdown("---")
+st.subheader("🔥 Bottleneck Analysis & Executive Dashboard")
+
+col1, col2 = st.columns(2)
+with col1:
+    start_timeline = st.date_input("Timeline Start Date:", datetime.date(2026, 9, 20))
+with col2:
+    num_weeks = st.slider("Number of Weeks to Analyze:", 5, 20, 10)
 
 weeks = [start_timeline + datetime.timedelta(days=7*i) for i in range(num_weeks)]
 week_labels = [w.strftime("%d-%b") for w in weeks]
 
-selected_disc = st.selectbox("اختر التخصص لعرض تفاصيله:", disciplines)
-disc_col_name = f"{selected_disc} (Hrs)"
+# Initialize demand dictionary for all disciplines
+demand = {disc: [0.0] * num_weeks for disc in disciplines}
 
-demand = [0] * num_weeks
-
-# محرك الحساب عالي الدقة
+# High Precision Calculation Engine (Actual Working Days) based on EDITED data
 for idx, row in edited_df.iterrows():
-    if pd.isnull(row.get('Start Date')) or pd.isnull(row.get('End Date')) or pd.isnull(row.get(disc_col_name)):
+    if pd.isnull(row.get('Start Date')) or pd.isnull(row.get('End Date')):
         continue
         
     s_date = row['Start Date']
     e_date = row['End Date']
-    total_hrs = float(row[disc_col_name])
     
-    # حساب أيام العمل للمشروع (متجاهلاً الجمعة والسبت)
+    # Calculate Total Working Days (Excluding Fri/Sat)
     workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask='1111100')
     if workdays_total <= 0: continue
-        
-    daily_rate = total_hrs / workdays_total
-    
-    for i, w_start in enumerate(weeks):
-        w_end = w_start + datetime.timedelta(days=6)
-        overlap_start = max(s_date, w_start)
-        overlap_end = min(e_date, w_end)
-        
-        if overlap_start <= overlap_end:
-            overlap_days = np.busday_count(overlap_start, overlap_end + datetime.timedelta(days=1), weekmask='1111100')
-            demand[i] += (daily_rate * overlap_days)
 
-# 6. عرض النتيجة
-results_df = pd.DataFrame({
-    "المؤشر": ["الساعات المطلوبة (Demand)", "السعة المتاحة (Capacity)", "الفارق/الاختناق (Variance)"],
-})
+    for disc in disciplines:
+        col_name = f"{disc} (Hrs)" if disc != "Arch Tech" else "Arch Tech (Hrs)"
+        if col_name not in row or pd.isnull(row.get(col_name)):
+            continue
+            
+        try:
+            total_hrs = float(row[col_name])
+        except ValueError:
+            continue
+            
+        daily_rate = total_hrs / workdays_total
+        
+        for i, w_start in enumerate(weeks):
+            w_end = w_start + datetime.timedelta(days=6)
+            overlap_start = max(s_date, w_start)
+            overlap_end = min(e_date, w_end)
+            
+            if overlap_start <= overlap_end:
+                overlap_days = np.busday_count(overlap_start, overlap_end + datetime.timedelta(days=1), weekmask='1111100')
+                demand[disc][i] += (daily_rate * overlap_days)
 
-for i, w_label in enumerate(week_labels):
-    dem = round(demand[i], 1)
-    cap = capacities[selected_disc]
-    var = round(cap - dem, 1)
-    results_df[w_label] = [dem, cap, var]
+# 6. Display Charts and Tables (Tabs for each discipline)
+tabs = st.tabs(disciplines)
 
 def highlight_bottlenecks(val):
     if isinstance(val, (int, float)) and val < 0:
         return 'background-color: #ffcccc; color: #900000; font-weight: bold'
     return ''
 
-st.dataframe(results_df.style.map(highlight_bottlenecks, subset=week_labels), use_container_width=True)
-
-# زر لتحميل البيانات المعدلة
-st.download_button(
-    label="📥 تحميل البيانات كملف CSV",
-    data=edited_df.to_csv(index=False).encode('utf-8'),
-    file_name='Engineering_Resource_Updated.csv',
-    mime='text/csv',
-)
+for idx, disc in enumerate(disciplines):
+    with tabs[idx]:
+        st.markdown(f"### {disc} Team Analysis")
+        
+        results_df = pd.DataFrame({
+            "Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Shortage/Surplus)"],
+        })
+        
+        var_list = []
+        dem_list = []
+        cap_list = []
+        
+        for i, w_label in enumerate(week_labels):
+            dem = round(demand[disc][i], 1)
+            cap = capacities[disc]
+            var = round(cap - dem, 1)
+            
+            results_df[w_label] = [dem, cap, var]
+            var_list.append(var)
+            dem_list.append(dem)
+            cap_list.append(cap)
+            
+        # Display Heatmap Table
+        st.dataframe(results_df.style.map(highlight_bottlenecks, subset=week_labels), use_container_width=True)
+        
+        # Prepare Chart Data
+        chart_data = pd.DataFrame({
+            "Week": week_labels,
+            "Variance (Shortage/Surplus)": var_list,
+            "Demand": dem_list,
+            "Capacity": cap_list
+        })
+        chart_data.set_index("Week", inplace=True)
+        
+        # Display Interactive Charts
+        st.markdown("#### 📉 Weekly Variance Chart (Dips below 0 indicate bottlenecks)")
+        st.bar_chart(chart_data["Variance (Shortage/Surplus)"], color="#d62728") 
+        
+        st.markdown("#### 📈 Demand vs Capacity Trend")
+        st.line_chart(chart_data[["Demand", "Capacity"]])
