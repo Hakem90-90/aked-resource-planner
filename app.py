@@ -8,9 +8,14 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - AKED")
+st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
+# mode "hours"      : the sheet has one hours column per discipline, e.g. "Arch Tech (Hrs)"
+# mode "team_count" : the sheet has a "Team Count" column; hours are calculated automatically as
+#                     Team Count x Working Days (Sun-Thu) x Working Hours per Day
+# engineers: default number of engineers per discipline (same order as "disciplines")
+# gid: None = first tab, or put the tab's gid number (the value after gid= in the sheet URL)
 TEAMS = {
     "Tech Team": {
         "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
@@ -39,6 +44,7 @@ def build_csv_url(sheet_id, gid=None):
 DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
+# numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
 NP_WEEKMASK = "1111001"
 PD_WEEKMASK = "Sun Mon Tue Wed Thu"
 HOURS_PER_DAY = 8
@@ -95,47 +101,78 @@ def load_from_gsheet(url, disciplines):
     raw_df = pd.read_csv(url)
     raw_df.columns = raw_df.columns.astype(str).str.strip()
     raw_df = raw_df.loc[:, ~raw_df.columns.str.startswith("Unnamed")]
-    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
 
     eng_counts = {}
-    split_idx = None
-    disc_col_idx = None
-    cnt_col_idx = None
 
-    # البحث عن جدول أعداد المهندسين أسفل الشيت (الذي يبدأ بـ Discipline / Team)
-    for idx, row in raw_df.iterrows():
-        for col_i, val in enumerate(row):
-            if pd.notnull(val) and "discipline" in str(val).lower():
-                split_idx = idx
-                disc_col_idx = col_i
-                # تحديد عمود العدد (العمود المجاور الذي يحتوي على عدد المهندسين)
-                for c_j in range(col_i + 1, len(row)):
-                    if pd.notnull(row.iloc[c_j]):
-                        cnt_col_idx = c_j
-                        break
-                if cnt_col_idx is None and col_i + 1 < len(row):
-                    cnt_col_idx = col_i + 1
-                break
-        if split_idx is not None:
-            break
+    # الحالة 1: جدول المهندسين موجود كأعمدة جانبية (مثلاً Discipline / Team و No. of Engineers في الصف الأول)
+    disc_col_name = None
+    eng_col_name = None
+    for c in raw_df.columns:
+        c_low = c.lower()
+        if "discipline" in c_low:
+            disc_col_name = c
+        elif "engineer" in c_low or "no. of eng" in c_low:
+            eng_col_name = c
 
-    # إذا وُجد جدول المهندسين، نفصله عن جدول المشاريع ونقرأ الأعداد منه
-    if split_idx is not None:
-        eng_rows = raw_df.iloc[split_idx + 1:]
-        df = raw_df.iloc[:split_idx].copy()
+    if disc_col_name is not None:
+        if eng_col_name is None:
+            # إذا لم يتعرف على اسم عمود الأعداد، يأخذ العمود المجاور لعمود التخصص مباشرة
+            idx = list(raw_df.columns).index(disc_col_name)
+            if idx + 1 < len(raw_df.columns):
+                eng_col_name = raw_df.columns[idx + 1]
 
-        for _, r in eng_rows.iterrows():
-            d_val = r.iloc[disc_col_idx] if disc_col_idx < len(r) else None
-            c_val = r.iloc[cnt_col_idx] if (cnt_col_idx is not None and cnt_col_idx < len(r)) else None
-            if pd.notnull(d_val) and pd.notnull(c_val):
-                matched_disc = match_discipline_name(d_val, disciplines)
-                if matched_disc:
-                    try:
-                        eng_counts[matched_disc] = int(float(c_val))
-                    except (ValueError, TypeError):
-                        pass
+        if eng_col_name is not None:
+            for _, r in raw_df[[disc_col_name, eng_col_name]].dropna(how="all").iterrows():
+                d_val, c_val = r[disc_col_name], r[eng_col_name]
+                if pd.notnull(d_val) and pd.notnull(c_val):
+                    matched_disc = match_discipline_name(d_val, disciplines)
+                    if matched_disc:
+                        try:
+                            eng_counts[matched_disc] = int(float(c_val))
+                        except (ValueError, TypeError):
+                            pass
+
+        # حذف أعمدة جدول المهندسين من جدول المشاريع حتى لا تظهر في جدول المشاريع
+        cols_to_drop = [c for c in [disc_col_name, eng_col_name] if c is not None and c in raw_df.columns]
+        df = raw_df.drop(columns=cols_to_drop).copy()
+
     else:
-        df = raw_df.copy()
+        # الحالة 2 (احتياطية): إذا كان جدول المهندسين موجوداً في أسفل الشيت تحت المشاريع
+        raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+        split_idx = None
+        disc_col_idx = None
+        cnt_col_idx = None
+
+        for idx, row in raw_df.iterrows():
+            for col_i, val in enumerate(row):
+                if pd.notnull(val) and "discipline" in str(val).lower():
+                    split_idx = idx
+                    disc_col_idx = col_i
+                    for c_j in range(col_i + 1, len(row)):
+                        if pd.notnull(row.iloc[c_j]):
+                            cnt_col_idx = c_j
+                            break
+                    if cnt_col_idx is None and col_i + 1 < len(row):
+                        cnt_col_idx = col_i + 1
+                    break
+            if split_idx is not None:
+                break
+
+        if split_idx is not None:
+            eng_rows = raw_df.iloc[split_idx + 1:]
+            df = raw_df.iloc[:split_idx].copy()
+            for _, r in eng_rows.iterrows():
+                d_val = r.iloc[disc_col_idx] if disc_col_idx < len(r) else None
+                c_val = r.iloc[cnt_col_idx] if (cnt_col_idx is not None and cnt_col_idx < len(r)) else None
+                if pd.notnull(d_val) and pd.notnull(c_val):
+                    matched_disc = match_discipline_name(d_val, disciplines)
+                    if matched_disc:
+                        try:
+                            eng_counts[matched_disc] = int(float(c_val))
+                        except (ValueError, TypeError):
+                            pass
+        else:
+            df = raw_df.copy()
 
     df = df.dropna(how="all").reset_index(drop=True)
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
@@ -158,7 +195,6 @@ col_a, col_b = st.columns([1, 3])
 with col_a:
     if st.button("🔄 Refresh from Google Sheet", use_container_width=True):
         load_from_gsheet.clear()
-        # مسح القيم المحفوظة في الـ session_state ليتم تحديث الأعداد من الشيت مباشرة
         for d in disciplines:
             st.session_state.pop(f"eng_{selected_team}_{d}", None)
         st.rerun()
