@@ -11,18 +11,13 @@ st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - AKED")
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
-# mode "hours"      : the sheet has one hours column per discipline, e.g. "Arch Tech (Hrs)"
-# mode "team_count" : the sheet has a "Team Count" column; hours are calculated automatically as
-#                     Team Count x Working Days (Sun-Thu) x Working Hours per Day
-# engineers: default number of engineers per discipline (same order as "disciplines")
-# gid: None = first tab, or put the tab's gid number (the value after gid= in the sheet URL)
 TEAMS = {
     "Tech Team": {
         "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
         "gid": None,
         "mode": "hours",
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
-        "engineers": [16, 10, 5, 5, 12],
+        "engineers": [16, 10, 5, 5, 12],  # Fallback defaults if not found in sheet
     },
     "Design Team": {
         "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
@@ -44,7 +39,6 @@ def build_csv_url(sheet_id, gid=None):
 DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
-# numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
 NP_WEEKMASK = "1111001"
 PD_WEEKMASK = "Sun Mon Tue Wed Thu"
 HOURS_PER_DAY = 8
@@ -76,18 +70,81 @@ def get_empty_template(mode="hours"):
     })
 
 
+def match_discipline_name(raw_name, disciplines):
+    """يربط اسم التخصص في جدول الإكسيل باسم التخصص المعتمد في الكود"""
+    raw_low = str(raw_name).strip().lower()
+    for d in disciplines:
+        d_low = d.lower()
+        if d_low in raw_low or raw_low in d_low:
+            return d
+        if "arch" in raw_low and "arch" in d_low:
+            return d
+        if "struct" in raw_low and "struct" in d_low:
+            return d
+        if "plumb" in raw_low and "plumb" in d_low:
+            return d
+        if "hvac" in raw_low and "hvac" in d_low:
+            return d
+        if "elec" in raw_low and "elec" in d_low:
+            return d
+    return None
+
+
 @st.cache_data(ttl=60, show_spinner="Loading data from Google Sheet...")
-def load_from_gsheet(url):
-    df = pd.read_csv(url)
-    df.columns = df.columns.astype(str).str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]  # drop columns without a header (e.g. unlabeled totals)
-    df = df.dropna(how="all")  # drop fully empty rows
+def load_from_gsheet(url, disciplines):
+    raw_df = pd.read_csv(url)
+    raw_df.columns = raw_df.columns.astype(str).str.strip()
+    raw_df = raw_df.loc[:, ~raw_df.columns.str.startswith("Unnamed")]
+    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+
+    eng_counts = {}
+    split_idx = None
+    disc_col_idx = None
+    cnt_col_idx = None
+
+    # البحث عن جدول أعداد المهندسين أسفل الشيت (الذي يبدأ بـ Discipline / Team)
+    for idx, row in raw_df.iterrows():
+        for col_i, val in enumerate(row):
+            if pd.notnull(val) and "discipline" in str(val).lower():
+                split_idx = idx
+                disc_col_idx = col_i
+                # تحديد عمود العدد (العمود المجاور الذي يحتوي على عدد المهندسين)
+                for c_j in range(col_i + 1, len(row)):
+                    if pd.notnull(row.iloc[c_j]):
+                        cnt_col_idx = c_j
+                        break
+                if cnt_col_idx is None and col_i + 1 < len(row):
+                    cnt_col_idx = col_i + 1
+                break
+        if split_idx is not None:
+            break
+
+    # إذا وُجد جدول المهندسين، نفصله عن جدول المشاريع ونقرأ الأعداد منه
+    if split_idx is not None:
+        eng_rows = raw_df.iloc[split_idx + 1:]
+        df = raw_df.iloc[:split_idx].copy()
+
+        for _, r in eng_rows.iterrows():
+            d_val = r.iloc[disc_col_idx] if disc_col_idx < len(r) else None
+            c_val = r.iloc[cnt_col_idx] if (cnt_col_idx is not None and cnt_col_idx < len(r)) else None
+            if pd.notnull(d_val) and pd.notnull(c_val):
+                matched_disc = match_discipline_name(d_val, disciplines)
+                if matched_disc:
+                    try:
+                        eng_counts[matched_disc] = int(float(c_val))
+                    except (ValueError, TypeError):
+                        pass
+    else:
+        df = raw_df.copy()
+
+    df = df.dropna(how="all").reset_index(drop=True)
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
     df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
     for c in df.columns:
         if c in DATA_COLS or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+
+    return df, eng_counts
 
 
 selected_team = st.radio("👥 Select Team:", list(TEAMS.keys()), horizontal=True)
@@ -101,15 +158,19 @@ col_a, col_b = st.columns([1, 3])
 with col_a:
     if st.button("🔄 Refresh from Google Sheet", use_container_width=True):
         load_from_gsheet.clear()
+        # مسح القيم المحفوظة في الـ session_state ليتم تحديث الأعداد من الشيت مباشرة
+        for d in disciplines:
+            st.session_state.pop(f"eng_{selected_team}_{d}", None)
         st.rerun()
 with col_b:
     st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
 
 try:
-    df_projects = load_from_gsheet(CSV_URL)
+    df_projects, sheet_eng_counts = load_from_gsheet(CSV_URL, disciplines)
     st.success(f"✅ {selected_team}: data loaded from Google Sheet.")
 except Exception as e:
     df_projects = get_empty_template(team_mode)
+    sheet_eng_counts = {}
     st.error(
         f"Could not read the {selected_team} Google Sheet ({e}). Make sure sharing is set to "
         "'Anyone with the link: Viewer'. Showing template data instead."
@@ -128,14 +189,19 @@ hours_per_day = st.sidebar.number_input(
 )
 st.sidebar.markdown("Set the number of available engineers:")
 
-default_engineers = team_cfg["engineers"]
+# استخدام أعداد المهندسين القادمة من الشيت (أو القيم الافتراضية في حال عدم وجودها)
+default_engineers = [
+    sheet_eng_counts.get(disc, fallback)
+    for disc, fallback in zip(disciplines, team_cfg["engineers"])
+]
+
 engineers = {}
 capacities = {}  # daily capacity (hours per working day)
 efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(
-        f"{disc} Engineers", value=default, min_value=0, key=f"eng_{selected_team}_{disc}"
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
     )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
 
@@ -309,7 +375,6 @@ st.subheader("🔥 Daily Bottleneck Analysis & Executive Dashboard")
 
 col1, col2 = st.columns(2)
 with col1:
-    # هنا تم التحديث ليكون تاريخ البداية هو تاريخ اليوم الحالي تلقائياً
     start_timeline = st.date_input("Timeline Start Date:", value=datetime.date.today())
 with col2:
     num_weeks = st.slider("Number of Weeks to Analyze:", 1, 12, 4)
