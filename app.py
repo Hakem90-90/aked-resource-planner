@@ -22,7 +22,7 @@ TEAMS = {
         "gid": None,
         "mode": "hours",
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
-        "engineers": [16, 10, 5, 5, 12],  # Fallback defaults if not found in sheet
+        "engineers": [17, 12, 5, 6, 12],  # Fallback defaults (Total = 52)
     },
     "Design Team": {
         "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
@@ -30,6 +30,13 @@ TEAMS = {
         "mode": "team_count",
         "disciplines": ["Arch Design Team"],
         "engineers": [10],
+    },
+    "QC Team": {
+        "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
+        "gid": None,
+        "mode": "hours",
+        "disciplines": ["Arch", "Structural", "MEP", "Electrical"],
+        "engineers": [2, 1, 1, 2],  # Fallback defaults (Total = 6)
     },
 }
 
@@ -41,7 +48,12 @@ def build_csv_url(sheet_id, gid=None):
     return url
 
 
-DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
+# Collect all possible hours columns across all teams
+DATA_COLS = list({
+    f"{d} (Hrs)"
+    for cfg in TEAMS.values()
+    for d in cfg["disciplines"]
+})
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
 # numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
@@ -53,7 +65,7 @@ HOURS_PER_DAY = 8
 # ----------------------------------------------------------------------
 # 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
 # ----------------------------------------------------------------------
-def get_empty_template(mode="hours"):
+def get_empty_template(mode="hours", disciplines=None):
     today = datetime.date.today()
     if mode == "team_count":
         return pd.DataFrame({
@@ -63,25 +75,26 @@ def get_empty_template(mode="hours"):
             "End Date": [today + datetime.timedelta(days=30)],
             "Team Count": [2],
         })
-    return pd.DataFrame({
+    data = {
         "No.": [1],
-        "Project / Contract Name": ["Example Project"],
+        "Project Name": ["Example Project"],
         "Start Date": [today],
         "End Date": [today + datetime.timedelta(days=30)],
-        "Arch Tech (Hrs)": [100.0],
-        "Structural (Hrs)": [80.0],
-        "Plumbing (Hrs)": [40.0],
-        "HVAC (Hrs)": [40.0],
-        "Electrical (Hrs)": [60.0],
-    })
+    }
+    for d in (disciplines or ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]):
+        data[f"{d} (Hrs)"] = [40.0]
+    return pd.DataFrame(data)
 
 
 def match_discipline_name(raw_name, disciplines):
-    """يربط اسم التخصص في جدول الإكسيل باسم التخصص المعتمد في الكود"""
+    """يربط اسم التخصص في جدول الإكسيل باسم التخصص المعتمد في الكود (بما في ذلك MECH -> MEP)"""
     raw_low = str(raw_name).strip().lower()
+    if not raw_low or "total" in raw_low:
+        return None
+
     for d in disciplines:
         d_low = d.lower()
-        if d_low in raw_low or raw_low in d_low:
+        if d_low == raw_low or d_low in raw_low or raw_low in d_low:
             return d
         if "arch" in raw_low and "arch" in d_low:
             return d
@@ -90,6 +103,8 @@ def match_discipline_name(raw_name, disciplines):
         if "plumb" in raw_low and "plumb" in d_low:
             return d
         if "hvac" in raw_low and "hvac" in d_low:
+            return d
+        if ("mech" in raw_low or "mep" in raw_low) and ("mep" in d_low or "mech" in d_low):
             return d
         if "elec" in raw_low and "elec" in d_low:
             return d
@@ -116,7 +131,6 @@ def load_from_gsheet(url, disciplines):
 
     if disc_col_name is not None:
         if eng_col_name is None:
-            # إذا لم يتعرف على اسم عمود الأعداد، يأخذ العمود المجاور لعمود التخصص مباشرة
             idx = list(raw_df.columns).index(disc_col_name)
             if idx + 1 < len(raw_df.columns):
                 eng_col_name = raw_df.columns[idx + 1]
@@ -178,7 +192,7 @@ def load_from_gsheet(url, disciplines):
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
     df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
     for c in df.columns:
-        if c in DATA_COLS or "count" in c.lower():
+        if c in DATA_COLS or "(hrs)" in c.lower() or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df, eng_counts
@@ -205,7 +219,7 @@ try:
     df_projects, sheet_eng_counts = load_from_gsheet(CSV_URL, disciplines)
     st.success(f"✅ {selected_team}: data loaded from Google Sheet.")
 except Exception as e:
-    df_projects = get_empty_template(team_mode)
+    df_projects = get_empty_template(team_mode, disciplines)
     sheet_eng_counts = {}
     st.error(
         f"Could not read the {selected_team} Google Sheet ({e}). Make sure sharing is set to "
@@ -240,6 +254,11 @@ for disc, default in zip(disciplines, default_engineers):
         f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
     )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
+
+# عرض العدد الكلي للمهندسين في الفريق للتأكد من المطابقة
+total_team_engineers = sum(engineers.values())
+st.sidebar.markdown("---")
+st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
 
 # ----------------------------------------------------------------------
 # 4. Project table (temporary edits only - not saved back to the sheet)
