@@ -8,28 +8,30 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - AKED")
+st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
-# mode "hours"      : the sheet has one hours column per discipline, e.g. "Arch Tech (Hrs)"
-# mode "team_count" : the sheet has a "Team Count" column; hours are calculated automatically as
-#                     Team Count x Working Days (Sun-Thu) x Working Hours per Day
-# engineers: default number of engineers per discipline (same order as "disciplines")
-# gid: None = first tab, or put the tab's gid number (the value after gid= in the sheet URL)
 TEAMS = {
     "Tech Team": {
         "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
         "gid": None,
         "mode": "hours",
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
-        "engineers": [16, 10, 5, 5, 12],
+        "engineers": [17, 12, 5, 6, 12],  # Fallback defaults (Total = 52)
     },
     "Design Team": {
         "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
         "gid": None,
         "mode": "team_count",
         "disciplines": ["Arch Design Team"],
-        "engineers": [10],
+        "engineers": [21],  # Fallback default from sheet (Total = 21)
+    },
+    "QC Team": {
+        "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
+        "gid": None,
+        "mode": "hours",
+        "disciplines": ["Arch", "Structural", "MEP", "Electrical"],
+        "engineers": [2, 1, 1, 2],  # Fallback defaults (Total = 6)
     },
 }
 
@@ -41,7 +43,12 @@ def build_csv_url(sheet_id, gid=None):
     return url
 
 
-DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
+# Collect all possible hours columns across all teams
+DATA_COLS = list({
+    f"{d} (Hrs)"
+    for cfg in TEAMS.values()
+    for d in cfg["disciplines"]
+}) + ["Calculated Hours"]
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
 # numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
@@ -53,7 +60,7 @@ HOURS_PER_DAY = 8
 # ----------------------------------------------------------------------
 # 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
 # ----------------------------------------------------------------------
-def get_empty_template(mode="hours"):
+def get_empty_template(mode="hours", disciplines=None):
     today = datetime.date.today()
     if mode == "team_count":
         return pd.DataFrame({
@@ -62,32 +69,165 @@ def get_empty_template(mode="hours"):
             "Start Date": [today],
             "End Date": [today + datetime.timedelta(days=30)],
             "Team Count": [2],
+            "Calculated Hours": [160.0],
         })
-    return pd.DataFrame({
+    data = {
         "No.": [1],
-        "Project / Contract Name": ["Example Project"],
+        "Project Name": ["Example Project"],
         "Start Date": [today],
         "End Date": [today + datetime.timedelta(days=30)],
-        "Arch Tech (Hrs)": [100.0],
-        "Structural (Hrs)": [80.0],
-        "Plumbing (Hrs)": [40.0],
-        "HVAC (Hrs)": [40.0],
-        "Electrical (Hrs)": [60.0],
-    })
+    }
+    for d in (disciplines or ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]):
+        data[f"{d} (Hrs)"] = [40.0]
+    return pd.DataFrame(data)
+
+
+def match_discipline_name(raw_name, disciplines):
+    """يربط اسم التخصص في جدول الإكسيل باسم التخصص المعتمد في الكود (بما في ذلك MECH -> MEP)"""
+    raw_low = str(raw_name).strip().lower()
+    if not raw_low or "total" in raw_low:
+        return None
+
+    for d in disciplines:
+        d_low = d.lower()
+        if d_low == raw_low or d_low in raw_low or raw_low in d_low:
+            return d
+        if "arch" in raw_low and "arch" in d_low:
+            return d
+        if "struct" in raw_low and "struct" in d_low:
+            return d
+        if "plumb" in raw_low and "plumb" in d_low:
+            return d
+        if "hvac" in raw_low and "hvac" in d_low:
+            return d
+        if ("mech" in raw_low or "mep" in raw_low) and ("mep" in d_low or "mech" in d_low):
+            return d
+        if "elec" in raw_low and "elec" in d_low:
+            return d
+    return None
 
 
 @st.cache_data(ttl=60, show_spinner="Loading data from Google Sheet...")
-def load_from_gsheet(url):
-    df = pd.read_csv(url)
-    df.columns = df.columns.astype(str).str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]  # drop columns without a header (e.g. unlabeled totals)
-    df = df.dropna(how="all")  # drop fully empty rows
+def load_from_gsheet(url, disciplines):
+    raw_df = pd.read_csv(url)
+    raw_df.columns = raw_df.columns.astype(str).str.strip()
+
+    eng_counts = {}
+    cols_to_drop = []
+
+    # 1. التحقق من وجود "Total Team count" في صف العناوين (كما في شيت Design Team حيث القيمة بجانبها في الصف الأول)
+    col_list = list(raw_df.columns)
+    for idx, c in enumerate(col_list):
+        c_low = c.lower()
+        if "total team" in c_low or ("total" in c_low and "count" in c_low):
+            cols_to_drop.append(c)
+            # فحص العمود المجاور مباشرة (قد يكون اسمه هو الرقم نفسه مثل "21")
+            if idx + 1 < len(col_list):
+                next_col = col_list[idx + 1]
+                cols_to_drop.append(next_col)
+                try:
+                    val = int(float(next_col))
+                    if len(disciplines) == 1:
+                        eng_counts[disciplines[0]] = val
+                except (ValueError, TypeError):
+                    # إذا لم يكن الرقم في العنوان، نبحث في أول خلية غير فارغة تحت العمود المجاور أو نفس العمود
+                    non_na = raw_df[next_col].dropna()
+                    if not non_na.empty:
+                        try:
+                            val = int(float(non_na.iloc[0]))
+                            if len(disciplines) == 1:
+                                eng_counts[disciplines[0]] = val
+                        except (ValueError, TypeError):
+                            pass
+            # أو إذا كان الرقم مكتوباً في الصف الذي تحت كلمة Total Team count مباشرة
+            if not eng_counts and len(disciplines) == 1:
+                non_na_self = raw_df[c].dropna()
+                if not non_na_self.empty:
+                    try:
+                        eng_counts[disciplines[0]] = int(float(non_na_self.iloc[0]))
+                    except (ValueError, TypeError):
+                        pass
+
+    # حذف الأعمدة الجانبية الخاصة بـ Total Team count والأعمدة غير المسماة
+    raw_df = raw_df.drop(columns=[c for c in cols_to_drop if c in raw_df.columns])
+    raw_df = raw_df.loc[:, ~raw_df.columns.str.startswith("Unnamed")]
+
+    # 2. التحقق من جدول المهندسين الجانبي (مثل Discipline / Team و No. of Engineers في Tech و QC)
+    disc_col_name = None
+    eng_col_name = None
+    for c in raw_df.columns:
+        c_low = c.lower()
+        if "discipline" in c_low:
+            disc_col_name = c
+        elif "engineer" in c_low or "no. of eng" in c_low:
+            eng_col_name = c
+
+    if disc_col_name is not None:
+        if eng_col_name is None:
+            idx = list(raw_df.columns).index(disc_col_name)
+            if idx + 1 < len(raw_df.columns):
+                eng_col_name = raw_df.columns[idx + 1]
+
+        if eng_col_name is not None:
+            for _, r in raw_df[[disc_col_name, eng_col_name]].dropna(how="all").iterrows():
+                d_val, c_val = r[disc_col_name], r[eng_col_name]
+                if pd.notnull(d_val) and pd.notnull(c_val):
+                    matched_disc = match_discipline_name(d_val, disciplines)
+                    if matched_disc:
+                        try:
+                            eng_counts[matched_disc] = int(float(c_val))
+                        except (ValueError, TypeError):
+                            pass
+
+        side_cols = [c for c in [disc_col_name, eng_col_name] if c is not None and c in raw_df.columns]
+        df = raw_df.drop(columns=side_cols).copy()
+
+    else:
+        # 3. حالة احتياطية: إذا كان جدول المهندسين موجوداً في أسفل الشيت تحت المشاريع
+        raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+        split_idx = None
+        disc_col_idx = None
+        cnt_col_idx = None
+
+        for idx, row in raw_df.iterrows():
+            for col_i, val in enumerate(row):
+                if pd.notnull(val) and "discipline" in str(val).lower():
+                    split_idx = idx
+                    disc_col_idx = col_i
+                    for c_j in range(col_i + 1, len(row)):
+                        if pd.notnull(row.iloc[c_j]):
+                            cnt_col_idx = c_j
+                            break
+                    if cnt_col_idx is None and col_i + 1 < len(row):
+                        cnt_col_idx = col_i + 1
+                    break
+            if split_idx is not None:
+                break
+
+        if split_idx is not None:
+            eng_rows = raw_df.iloc[split_idx + 1:]
+            df = raw_df.iloc[:split_idx].copy()
+            for _, r in eng_rows.iterrows():
+                d_val = r.iloc[disc_col_idx] if disc_col_idx < len(r) else None
+                c_val = r.iloc[cnt_col_idx] if (cnt_col_idx is not None and cnt_col_idx < len(r)) else None
+                if pd.notnull(d_val) and pd.notnull(c_val):
+                    matched_disc = match_discipline_name(d_val, disciplines)
+                    if matched_disc:
+                        try:
+                            eng_counts[matched_disc] = int(float(c_val))
+                        except (ValueError, TypeError):
+                            pass
+        else:
+            df = raw_df.copy()
+
+    df = df.dropna(how="all").reset_index(drop=True)
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
     df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
     for c in df.columns:
-        if c in DATA_COLS or "count" in c.lower():
+        if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+
+    return df, eng_counts
 
 
 selected_team = st.radio("👥 Select Team:", list(TEAMS.keys()), horizontal=True)
@@ -101,15 +241,18 @@ col_a, col_b = st.columns([1, 3])
 with col_a:
     if st.button("🔄 Refresh from Google Sheet", use_container_width=True):
         load_from_gsheet.clear()
+        for d in disciplines:
+            st.session_state.pop(f"eng_{selected_team}_{d}", None)
         st.rerun()
 with col_b:
     st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
 
 try:
-    df_projects = load_from_gsheet(CSV_URL)
+    df_projects, sheet_eng_counts = load_from_gsheet(CSV_URL, disciplines)
     st.success(f"✅ {selected_team}: data loaded from Google Sheet.")
 except Exception as e:
-    df_projects = get_empty_template(team_mode)
+    df_projects = get_empty_template(team_mode, disciplines)
+    sheet_eng_counts = {}
     st.error(
         f"Could not read the {selected_team} Google Sheet ({e}). Make sure sharing is set to "
         "'Anyone with the link: Viewer'. Showing template data instead."
@@ -123,21 +266,30 @@ st.sidebar.caption(f"Team: **{selected_team}**")
 hours_per_day = st.sidebar.number_input(
     "Working Hours per Day (per engineer)",
     min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
-    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor. "
-         "For teams that use Team Count, hours are also calculated as Team Count × Working Days × Hours per Day.",
+    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor.",
 )
 st.sidebar.markdown("Set the number of available engineers:")
 
-default_engineers = team_cfg["engineers"]
+# استخدام أعداد المهندسين القادمة من الشيت (أو القيم الافتراضية في حال عدم وجودها)
+default_engineers = [
+    sheet_eng_counts.get(disc, fallback)
+    for disc, fallback in zip(disciplines, team_cfg["engineers"])
+]
+
 engineers = {}
 capacities = {}  # daily capacity (hours per working day)
 efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(
-        f"{disc} Engineers", value=default, min_value=0, key=f"eng_{selected_team}_{disc}"
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
     )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
+
+# عرض العدد الكلي للمهندسين في الفريق
+total_team_engineers = sum(engineers.values())
+st.sidebar.markdown("---")
+st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
 
 # ----------------------------------------------------------------------
 # 4. Project table (temporary edits only - not saved back to the sheet)
@@ -154,7 +306,7 @@ edited_df = st.data_editor(
 )
 
 # ----------------------------------------------------------------------
-# 4a. Calculated hours (only for teams that use "Team Count")
+# 4a. Prepare hours column in the background for Design Team (no extra UI table)
 # ----------------------------------------------------------------------
 calc_df = edited_df.copy()
 
@@ -169,36 +321,38 @@ def find_count_col(df):
     return None
 
 
+def find_calc_hrs_col(df):
+    for c in df.columns:
+        if "calculated" in str(c).lower() or "hours" in str(c).lower() or "(hrs)" in str(c).lower():
+            return c
+    return None
+
+
+count_col = find_count_col(calc_df)
+
 if team_mode == "team_count":
-    count_col = find_count_col(calc_df)
-    if count_col is None:
-        st.error(
-            "Could not find a 'Team Count' column in the sheet. "
-            f"Columns found: {list(calc_df.columns)}"
-        )
-        st.stop()
-
     hrs_col_name = f"{disciplines[0]} (Hrs)"
-    calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce")
+    sheet_hrs_col = find_calc_hrs_col(calc_df)
 
-    work_days = []
-    for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"]):
-        if pd.isnull(s_d) or pd.isnull(e_d):
-            work_days.append(0)
-        else:
-            work_days.append(max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))))
-    calc_df["Working Days (Sun-Thu)"] = work_days
-    calc_df[hrs_col_name] = (calc_df[count_col].fillna(0) * calc_df["Working Days (Sun-Thu)"] * hours_per_day)
-
-    st.markdown(f"##### 🧮 Calculated Hours: {count_col} × Working Days (Sun-Thu) × {hours_per_day:g} hrs/day")
-    st.dataframe(calc_df, use_container_width=True, hide_index=True)
-    st.caption(f"Total calculated hours for all projects: **{calc_df[hrs_col_name].sum():,.1f}**")
+    if sheet_hrs_col is not None:
+        # أخذ الساعات المحسوبة مباشرة من عمود Calculated Hours في الشيت
+        calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
+    elif count_col is not None:
+        # احتياطي فقط إذا لم يوجد عمود Calculated Hours
+        calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
+        work_days = [
+            0 if (pd.isnull(s_d) or pd.isnull(e_d))
+            else max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)))
+            for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"])
+        ]
+        calc_df[hrs_col_name] = calc_df[count_col] * work_days * hours_per_day
 
 # ----------------------------------------------------------------------
 # 4b. Project Timeline (Gantt Chart) - updates automatically from the table
 # ----------------------------------------------------------------------
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
+
 
 def find_name_col(df):
     """Find the project-name column even if the header text differs slightly."""
@@ -259,7 +413,7 @@ else:
     x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
     extra_tooltips = []
-    if team_mode == "team_count":
+    if team_mode == "team_count" and count_col is not None and count_col in gantt_df.columns:
         gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
         extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
 
@@ -309,7 +463,6 @@ st.subheader("🔥 Daily Bottleneck Analysis & Executive Dashboard")
 
 col1, col2 = st.columns(2)
 with col1:
-    # هنا تم التحديث ليكون تاريخ البداية هو تاريخ اليوم الحالي تلقائياً
     start_timeline = st.date_input("Timeline Start Date:", value=datetime.date.today())
 with col2:
     num_weeks = st.slider("Number of Weeks to Analyze:", 1, 12, 4)
