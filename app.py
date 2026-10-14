@@ -54,19 +54,20 @@ HOURS_PER_DAY = 8
 # 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
 # ----------------------------------------------------------------------
 def get_empty_template(mode="hours"):
+    today = datetime.date.today()
     if mode == "team_count":
         return pd.DataFrame({
             "No.": [1],
             "Project Name": ["Example Project"],
-            "Start Date": [datetime.date(2026, 9, 20)],
-            "End Date": [datetime.date(2026, 10, 20)],
+            "Start Date": [today],
+            "End Date": [today + datetime.timedelta(days=30)],
             "Team Count": [2],
         })
     return pd.DataFrame({
         "No.": [1],
         "Project / Contract Name": ["Example Project"],
-        "Start Date": [datetime.date(2026, 9, 20)],
-        "End Date": [datetime.date(2026, 10, 20)],
+        "Start Date": [today],
+        "End Date": [today + datetime.timedelta(days=30)],
         "Arch Tech (Hrs)": [100.0],
         "Structural (Hrs)": [80.0],
         "Plumbing (Hrs)": [40.0],
@@ -308,7 +309,8 @@ st.subheader("🔥 Daily Bottleneck Analysis & Executive Dashboard")
 
 col1, col2 = st.columns(2)
 with col1:
-    start_timeline = st.date_input("Timeline Start Date:", datetime.date(2026, 9, 20))
+    # هنا تم التحديث ليكون تاريخ البداية هو تاريخ اليوم الحالي تلقائياً
+    start_timeline = st.date_input("Timeline Start Date:", value=datetime.date.today())
 with col2:
     num_weeks = st.slider("Number of Weeks to Analyze:", 1, 12, 4)
 
