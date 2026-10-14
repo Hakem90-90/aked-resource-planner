@@ -8,13 +8,38 @@ import altair as alt
 # 1. Page Configuration
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
-st.title("📊 Dynamic Engineering Resource Planner - ACKD")
+st.title("📊 Dynamic Engineering Resource Planner - AKED")
 
-SHEET_ID = "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ"
-SHEET_GID = None  # None = first tab. Or put the tab's gid number, e.g. 123456789
-CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-if SHEET_GID is not None:
-    CSV_URL += f"&gid={SHEET_GID}"
+# ----- Teams: each team has its own Google Sheet and default number of engineers -----
+# mode "hours"      : the sheet has one hours column per discipline, e.g. "Arch Tech (Hrs)"
+# mode "team_count" : the sheet has a "Team Count" column; hours are calculated automatically as
+#                     Team Count x Working Days (Sun-Thu) x Working Hours per Day
+# engineers: default number of engineers per discipline (same order as "disciplines")
+# gid: None = first tab, or put the tab's gid number (the value after gid= in the sheet URL)
+TEAMS = {
+    "Tech Team": {
+        "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
+        "gid": None,
+        "mode": "hours",
+        "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
+        "engineers": [16, 10, 5, 5, 12],
+    },
+    "Design Team": {
+        "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
+        "gid": None,
+        "mode": "team_count",
+        "disciplines": ["Arch Design Team"],
+        "engineers": [10],
+    },
+}
+
+
+def build_csv_url(sheet_id, gid=None):
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    if gid is not None:
+        url += f"&gid={gid}"
+    return url
+
 
 DATA_COLS = ["Arch Tech (Hrs)", "Structural (Hrs)", "Plumbing (Hrs)", "HVAC (Hrs)", "Electrical (Hrs)"]
 
@@ -28,7 +53,15 @@ HOURS_PER_DAY = 8
 # ----------------------------------------------------------------------
 # 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
 # ----------------------------------------------------------------------
-def get_empty_template():
+def get_empty_template(mode="hours"):
+    if mode == "team_count":
+        return pd.DataFrame({
+            "No.": [1],
+            "Project Name": ["Example Project"],
+            "Start Date": [datetime.date(2026, 9, 20)],
+            "End Date": [datetime.date(2026, 10, 20)],
+            "Team Count": [2],
+        })
     return pd.DataFrame({
         "No.": [1],
         "Project / Contract Name": ["Example Project"],
@@ -46,13 +79,22 @@ def get_empty_template():
 def load_from_gsheet(url):
     df = pd.read_csv(url)
     df.columns = df.columns.astype(str).str.strip()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]  # drop columns without a header (e.g. unlabeled totals)
+    df = df.dropna(how="all")  # drop fully empty rows
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
     df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
-    for c in DATA_COLS:
-        if c in df.columns:
+    for c in df.columns:
+        if c in DATA_COLS or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+
+selected_team = st.radio("👥 Select Team:", list(TEAMS.keys()), horizontal=True)
+team_cfg = TEAMS[selected_team]
+team_mode = team_cfg["mode"]
+disciplines = team_cfg["disciplines"]
+SHEET_ID = team_cfg["sheet_id"]
+CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 
 col_a, col_b = st.columns([1, 3])
 with col_a:
@@ -64,11 +106,11 @@ with col_b:
 
 try:
     df_projects = load_from_gsheet(CSV_URL)
-    st.success("✅ Data loaded from Google Sheet.")
+    st.success(f"✅ {selected_team}: data loaded from Google Sheet.")
 except Exception as e:
-    df_projects = get_empty_template()
+    df_projects = get_empty_template(team_mode)
     st.error(
-        f"Could not read the Google Sheet ({e}). Make sure sharing is set to "
+        f"Could not read the {selected_team} Google Sheet ({e}). Make sure sharing is set to "
         "'Anyone with the link: Viewer'. Showing template data instead."
     )
 
@@ -76,21 +118,24 @@ except Exception as e:
 # 3. Sidebar - Capacity Settings
 # ----------------------------------------------------------------------
 st.sidebar.header("⚙️ Team Capacity Settings")
+st.sidebar.caption(f"Team: **{selected_team}**")
 hours_per_day = st.sidebar.number_input(
     "Working Hours per Day (per engineer)",
     min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
-    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor",
+    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor. "
+         "For teams that use Team Count, hours are also calculated as Team Count × Working Days × Hours per Day.",
 )
 st.sidebar.markdown("Set the number of available engineers:")
 
-disciplines = ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]
-default_engineers = [16, 10, 5, 5, 12]
+default_engineers = team_cfg["engineers"]
 engineers = {}
 capacities = {}  # daily capacity (hours per working day)
 efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
-    engineers[disc] = st.sidebar.number_input(f"{disc} Engineers", value=default, min_value=0)
+    engineers[disc] = st.sidebar.number_input(
+        f"{disc} Engineers", value=default, min_value=0, key=f"eng_{selected_team}_{disc}"
+    )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
 
 # ----------------------------------------------------------------------
@@ -101,10 +146,52 @@ st.caption("Data comes from the Google Sheet. Changes made here are temporary (f
 
 edited_df = st.data_editor(
     df_projects,
+    key=f"editor_{selected_team}",
     num_rows="dynamic",
     use_container_width=True,
     hide_index=True,
 )
+
+# ----------------------------------------------------------------------
+# 4a. Calculated hours (only for teams that use "Team Count")
+# ----------------------------------------------------------------------
+calc_df = edited_df.copy()
+
+
+def find_count_col(df):
+    for c in df.columns:
+        if "count" in str(c).lower():
+            return c
+    for c in df.columns:
+        if "team" in str(c).lower():
+            return c
+    return None
+
+
+if team_mode == "team_count":
+    count_col = find_count_col(calc_df)
+    if count_col is None:
+        st.error(
+            "Could not find a 'Team Count' column in the sheet. "
+            f"Columns found: {list(calc_df.columns)}"
+        )
+        st.stop()
+
+    hrs_col_name = f"{disciplines[0]} (Hrs)"
+    calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce")
+
+    work_days = []
+    for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"]):
+        if pd.isnull(s_d) or pd.isnull(e_d):
+            work_days.append(0)
+        else:
+            work_days.append(max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))))
+    calc_df["Working Days (Sun-Thu)"] = work_days
+    calc_df[hrs_col_name] = (calc_df[count_col].fillna(0) * calc_df["Working Days (Sun-Thu)"] * hours_per_day)
+
+    st.markdown(f"##### 🧮 Calculated Hours: {count_col} × Working Days (Sun-Thu) × {hours_per_day:g} hrs/day")
+    st.dataframe(calc_df, use_container_width=True, hide_index=True)
+    st.caption(f"Total calculated hours for all projects: **{calc_df[hrs_col_name].sum():,.1f}**")
 
 # ----------------------------------------------------------------------
 # 4b. Project Timeline (Gantt Chart) - updates automatically from the table
@@ -141,7 +228,7 @@ def make_project_label(r):
     return name
 
 
-gantt_df = edited_df.copy()
+gantt_df = calc_df.copy()
 gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
 gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
 gantt_df = gantt_df.dropna(subset=["Start", "End"])
@@ -150,7 +237,7 @@ gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
 if gantt_df.empty:
     st.info("No projects with valid start and end dates to display.")
 else:
-    hrs_cols = [c for c in DATA_COLS if c in gantt_df.columns]
+    hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(make_project_label, axis=1)
     gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)  # include the end day in the bar
     gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
@@ -170,6 +257,11 @@ else:
     x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
     x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
+    extra_tooltips = []
+    if team_mode == "team_count":
+        gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
+        extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
+
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
         y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
@@ -181,6 +273,7 @@ else:
             alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
             alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
             alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
+            *extra_tooltips,
         ],
     )
 
@@ -225,7 +318,7 @@ day_labels = [d.strftime("%a %d-%b") for d in days]
 
 demand = {disc: [0.0] * num_days for disc in disciplines}
 
-for idx, row in edited_df.iterrows():
+for idx, row in calc_df.iterrows():
     if pd.isnull(row.get("Start Date")) or pd.isnull(row.get("End Date")):
         continue
 
@@ -267,7 +360,8 @@ def highlight_bottlenecks(val):
 
 for idx, disc in enumerate(disciplines):
     with tabs[idx]:
-        st.markdown(f"### {disc} Team Analysis (Daily)")
+        team_title = disc if disc.endswith("Team") else f"{disc} Team"
+        st.markdown(f"### {team_title} Analysis (Daily)")
 
         results_df = pd.DataFrame({
             "Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Shortage/Surplus)"],
