@@ -121,7 +121,6 @@ def load_from_gsheet(url, disciplines):
         c_low = c.lower()
         if "total team" in c_low or ("total" in c_low and "count" in c_low):
             cols_to_drop.append(c)
-            # فحص العمود المجاور مباشرة (قد يكون اسمه هو الرقم نفسه مثل "21")
             if idx + 1 < len(col_list):
                 next_col = col_list[idx + 1]
                 cols_to_drop.append(next_col)
@@ -130,7 +129,6 @@ def load_from_gsheet(url, disciplines):
                     if len(disciplines) == 1:
                         eng_counts[disciplines[0]] = val
                 except (ValueError, TypeError):
-                    # إذا لم يكن الرقم في العنوان، نبحث في أول خلية غير فارغة تحت العمود المجاور أو نفس العمود
                     non_na = raw_df[next_col].dropna()
                     if not non_na.empty:
                         try:
@@ -139,7 +137,6 @@ def load_from_gsheet(url, disciplines):
                                 eng_counts[disciplines[0]] = val
                         except (ValueError, TypeError):
                             pass
-            # أو إذا كان الرقم مكتوباً في الصف الذي تحت كلمة Total Team count مباشرة
             if not eng_counts and len(disciplines) == 1:
                 non_na_self = raw_df[c].dropna()
                 if not non_na_self.empty:
@@ -335,10 +332,8 @@ if team_mode == "team_count":
     sheet_hrs_col = find_calc_hrs_col(calc_df)
 
     if sheet_hrs_col is not None:
-        # أخذ الساعات المحسوبة مباشرة من عمود Calculated Hours في الشيت
         calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
     elif count_col is not None:
-        # احتياطي فقط إذا لم يوجد عمود Calculated Hours
         calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
         work_days = [
             0 if (pd.isnull(s_d) or pd.isnull(e_d))
@@ -352,6 +347,12 @@ if team_mode == "team_count":
 # ----------------------------------------------------------------------
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
+
+# فلتر لإظهار المهام المستمرة فقط وإخفاء المنتهية حتى تاريخ اليوم
+hide_completed = st.checkbox(
+    "🔍 إخفاء المهام المنتهية (إظهار المهام المستمرة والقادمة فقط حتى تاريخ اليوم)",
+    value=True,
+)
 
 
 def find_name_col(df):
@@ -389,8 +390,13 @@ gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
 gantt_df = gantt_df.dropna(subset=["Start", "End"])
 gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
 
+# تطبيق الفلتر: الاحتفاظ فقط بالمشاريع التي تاريخ نهايتها اليوم أو بعد اليوم
+today = pd.Timestamp.today().normalize()
+if hide_completed:
+    gantt_df = gantt_df[gantt_df["End"] >= today]
+
 if gantt_df.empty:
-    st.info("No projects with valid start and end dates to display.")
+    st.info("No ongoing or upcoming projects with valid dates to display.")
 else:
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(make_project_label, axis=1)
@@ -444,7 +450,6 @@ else:
     layers = [bars, date_labels]
 
     # Red dashed line for today (only if it falls inside the projects' date range)
-    today = pd.Timestamp.today().normalize()
     if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
         today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
             color="red", strokeDash=[5, 4], strokeWidth=2
