@@ -348,11 +348,8 @@ if team_mode == "team_count":
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
 
-# فلتر لإظهار المهام المستمرة فقط وإخفاء المنتهية حتى تاريخ اليوم
-hide_completed = st.checkbox(
-    "🔍 إخفاء المهام المنتهية (إظهار المهام المستمرة والقادمة فقط حتى تاريخ اليوم)",
-    value=True,
-)
+# فلتر لإخفاء المهام المنتهية
+hide_completed = st.checkbox("Filter completed", value=True)
 
 
 def find_name_col(df):
