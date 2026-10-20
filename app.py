@@ -797,7 +797,7 @@ CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 st.markdown("---")
 available_backups = list_backups(selected_team)
 
-c_mode, c_hist, c_actions = st.columns([2, 2, 2])
+c_mode, c_hist, c_actions = st.columns([1.8, 1.8, 2.8])
 with c_mode:
     data_source = st.radio(
         "📂 Data Source:",
@@ -820,11 +820,13 @@ with c_hist:
 
 with c_actions:
     st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-    c_btn1, c_btn2 = st.columns(2)
+    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1.4])
     with c_btn1:
         refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
     with c_btn2:
         save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot.")
+    with c_btn3:
+        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
 
 if refresh_clicked:
     load_from_gsheet.clear()
