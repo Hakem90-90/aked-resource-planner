@@ -54,7 +54,7 @@ TEAMS = {
     },
 }
 
-# ----- Gantt Chart option (WBS file) -----
+MAIN_OPTION = "Main"
 GANTT_OPTION = "Gantt Chart"
 WBS_SHEET_ID = "1kjQtf7UkFNrgn0imyqAlYEzTPzUbR5evY5lQ8alZUIQ"
 
@@ -745,11 +745,188 @@ def render_wbs_gantt():
 
 
 # ----------------------------------------------------------------------
+# 2c. Helper Functions for Team Gantt Charts
+# ----------------------------------------------------------------------
+def find_count_col(df):
+    for c in df.columns:
+        if "count" in str(c).lower():
+            return c
+    for c in df.columns:
+        if "team" in str(c).lower():
+            return c
+    return None
+
+
+def find_calc_hrs_col(df):
+    for c in df.columns:
+        if "calculated" in str(c).lower() or "hours" in str(c).lower() or "(hrs)" in str(c).lower():
+            return c
+    return None
+
+
+def find_name_col(df):
+    skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
+    for c in df.columns:
+        low = str(c).lower()
+        if c not in skip and any(k in low for k in ("name", "project", "contract")):
+            return c
+    for c in df.columns:
+        if c not in skip and df[c].dtype == object:
+            return c
+    return None
+
+
+def make_project_label(r, name_col):
+    name = r.get(name_col) if name_col is not None else None
+    name = str(name).strip() if pd.notnull(name) and str(name).strip() != "" else "Unnamed"
+    no = r.get("No.")
+    if pd.notnull(no) and str(no).strip() != "":
+        try:
+            no = int(float(no))
+        except (ValueError, TypeError):
+            pass
+        return f"{no}. {name}"
+    return name
+
+
+def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
+    calc_df = df.copy()
+    count_col = find_count_col(calc_df)
+
+    if team_mode == "team_count":
+        hrs_col_name = f"{disciplines[0]} (Hrs)"
+        sheet_hrs_col = find_calc_hrs_col(calc_df)
+
+        if sheet_hrs_col is not None:
+            calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
+        elif count_col is not None:
+            calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
+            work_days = [
+                0 if (pd.isnull(s_d) or pd.isnull(e_d))
+                else max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)))
+                for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"])
+            ]
+            calc_df[hrs_col_name] = calc_df[count_col] * work_days * hours_per_day
+
+    return calc_df, count_col
+
+
+def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed=True):
+    name_col = find_name_col(calc_df)
+    gantt_df = calc_df.copy()
+    gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
+    gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
+    gantt_df = gantt_df.dropna(subset=["Start", "End"])
+    gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
+
+    today = pd.Timestamp.today().normalize()
+    if hide_completed:
+        gantt_df = gantt_df[gantt_df["End"] >= today]
+
+    if gantt_df.empty:
+        st.info("No ongoing or upcoming projects with valid dates to display.")
+        return
+
+    hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
+    gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
+    gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
+    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
+    gantt_df["WorkDays"] = [
+        int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+        for s, e in zip(gantt_df["Start"], gantt_df["End"])
+    ]
+    gantt_df = gantt_df.sort_values(["Start", "End"])
+    gantt_df["DateRange"] = [
+        f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}" for s, e in zip(gantt_df["Start"], gantt_df["End"])
+    ]
+    project_order = gantt_df["Project"].tolist()
+
+    x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
+    span_days = (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days
+    x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
+    x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
+
+    extra_tooltips = []
+    if team_mode == "team_count" and count_col is not None and count_col in gantt_df.columns:
+        gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
+        extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
+
+    bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
+        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
+        x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
+        x2="EndPlus:T",
+        color=alt.Color("Project:N", legend=None),
+        tooltip=[
+            alt.Tooltip("Project:N", title="Project"),
+            alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
+            alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
+            alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
+            alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
+            *extra_tooltips,
+        ],
+    )
+
+    date_labels = alt.Chart(gantt_df).mark_text(
+        align="left", baseline="middle", dx=6, fontSize=11
+    ).encode(
+        y=alt.Y("Project:N", sort=project_order),
+        x=alt.X("EndPlus:T", scale=x_scale),
+        text="DateRange:N",
+    )
+
+    layers = [bars, date_labels]
+
+    if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
+        today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
+            color="red", strokeDash=[5, 4], strokeWidth=2
+        ).encode(x=alt.X("Today:T", scale=x_scale))
+        layers.append(today_rule)
+
+    gantt_chart = alt.layer(*layers).properties(height=max(150, 34 * len(gantt_df) + 60))
+    st.altair_chart(gantt_chart, use_container_width=True)
+
+
+# ----------------------------------------------------------------------
+# 2d. Main View: All 4 Teams Gantt Charts in One Page
+# ----------------------------------------------------------------------
+def render_main_overview():
+    st.subheader("🗓️ Project Timelines - Main Overview (All Teams)")
+
+    col_f1, col_f2 = st.columns([2, 2])
+    with col_f1:
+        hide_comp = st.checkbox("Filter completed", value=True, key="main_hide_comp")
+    with col_f2:
+        if st.button("🔄 Refresh All Sheets", use_container_width=True):
+            load_from_gsheet.clear()
+            load_team_counts.clear()
+            st.rerun()
+
+    team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
+    for t_name in team_order:
+        if t_name not in TEAMS:
+            continue
+        cfg = TEAMS[t_name]
+        st.markdown(f"### 👥 {t_name} - Project Timeline")
+        try:
+            csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
+            team_df, _ = load_from_gsheet(csv_url, cfg["disciplines"])
+            team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
+            render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
+        except Exception as e:
+            st.error(f"Could not load data for {t_name}: {e}")
+        st.markdown("---")
+
+
+# ----------------------------------------------------------------------
 # Team selection
 # ----------------------------------------------------------------------
 selected_team = st.radio(
-    "👥 Select Team:", list(TEAMS.keys()) + [GANTT_OPTION], horizontal=True
+    "👥 Select View / Team:", [MAIN_OPTION] + list(TEAMS.keys()) + [GANTT_OPTION], horizontal=True
 )
+
+if selected_team == MAIN_OPTION:
+    render_main_overview()
+    st.stop()
 
 if selected_team == GANTT_OPTION:
     render_wbs_gantt()
@@ -762,7 +939,7 @@ SHEET_ID = team_cfg["sheet_id"]
 CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 
 # ----------------------------------------------------------------------
-# 2c. Data Source Selection & Daily Backup Controls
+# 2e. Data Source Selection & Daily Backup Controls
 # ----------------------------------------------------------------------
 st.markdown("---")
 available_backups = list_backups(selected_team)
@@ -847,7 +1024,7 @@ else:
     st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Daily backup automatically archived).")
 
 # ----------------------------------------------------------------------
-# 2d. Differences & Change Comparison (مقارنة الفروقات)
+# 2f. Differences & Change Comparison (مقارنة الفروقات)
 # ----------------------------------------------------------------------
 with st.expander("🔍 Compare Changes with a Previous Backup (مقارنة الفروقات)"):
     if not available_backups:
@@ -929,42 +1106,7 @@ edited_df = st.data_editor(
 # ----------------------------------------------------------------------
 # 4a. Prepare hours column in background
 # ----------------------------------------------------------------------
-calc_df = edited_df.copy()
-
-
-def find_count_col(df):
-    for c in df.columns:
-        if "count" in str(c).lower():
-            return c
-    for c in df.columns:
-        if "team" in str(c).lower():
-            return c
-    return None
-
-
-def find_calc_hrs_col(df):
-    for c in df.columns:
-        if "calculated" in str(c).lower() or "hours" in str(c).lower() or "(hrs)" in str(c).lower():
-            return c
-    return None
-
-
-count_col = find_count_col(calc_df)
-
-if team_mode == "team_count":
-    hrs_col_name = f"{disciplines[0]} (Hrs)"
-    sheet_hrs_col = find_calc_hrs_col(calc_df)
-
-    if sheet_hrs_col is not None:
-        calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
-    elif count_col is not None:
-        calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
-        work_days = [
-            0 if (pd.isnull(s_d) or pd.isnull(e_d))
-            else max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)))
-            for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"])
-        ]
-        calc_df[hrs_col_name] = calc_df[count_col] * work_days * hours_per_day
+calc_df, count_col = prepare_calc_df(edited_df, team_mode, disciplines, hours_per_day)
 
 # ----------------------------------------------------------------------
 # 4b. Project Timeline (Gantt Chart)
@@ -972,107 +1114,8 @@ if team_mode == "team_count":
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
 
-hide_completed = st.checkbox("Filter completed", value=True)
-
-
-def find_name_col(df):
-    skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
-    for c in df.columns:
-        low = str(c).lower()
-        if c not in skip and any(k in low for k in ("name", "project", "contract")):
-            return c
-    for c in df.columns:
-        if c not in skip and df[c].dtype == object:
-            return c
-    return None
-
-
-NAME_COL = find_name_col(edited_df)
-
-
-def make_project_label(r):
-    name = r.get(NAME_COL) if NAME_COL is not None else None
-    name = str(name).strip() if pd.notnull(name) and str(name).strip() != "" else "Unnamed"
-    no = r.get("No.")
-    if pd.notnull(no) and str(no).strip() != "":
-        try:
-            no = int(float(no))
-        except (ValueError, TypeError):
-            pass
-        return f"{no}. {name}"
-    return name
-
-
-gantt_df = calc_df.copy()
-gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
-gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
-gantt_df = gantt_df.dropna(subset=["Start", "End"])
-gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
-
-today = pd.Timestamp.today().normalize()
-if hide_completed:
-    gantt_df = gantt_df[gantt_df["End"] >= today]
-
-if gantt_df.empty:
-    st.info("No ongoing or upcoming projects with valid dates to display.")
-else:
-    hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
-    gantt_df["Project"] = gantt_df.apply(make_project_label, axis=1)
-    gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
-    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-    gantt_df["WorkDays"] = [
-        int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-        for s, e in zip(gantt_df["Start"], gantt_df["End"])
-    ]
-    gantt_df = gantt_df.sort_values(["Start", "End"])
-    gantt_df["DateRange"] = [
-        f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}" for s, e in zip(gantt_df["Start"], gantt_df["End"])
-    ]
-    project_order = gantt_df["Project"].tolist()
-
-    x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
-    span_days = (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days
-    x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
-    x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
-
-    extra_tooltips = []
-    if team_mode == "team_count" and count_col is not None and count_col in gantt_df.columns:
-        gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
-        extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
-
-    bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
-        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
-        x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
-        x2="EndPlus:T",
-        color=alt.Color("Project:N", legend=None),
-        tooltip=[
-            alt.Tooltip("Project:N", title="Project"),
-            alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
-            alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
-            alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
-            alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
-            *extra_tooltips,
-        ],
-    )
-
-    date_labels = alt.Chart(gantt_df).mark_text(
-        align="left", baseline="middle", dx=6, fontSize=11
-    ).encode(
-        y=alt.Y("Project:N", sort=project_order),
-        x=alt.X("EndPlus:T", scale=x_scale),
-        text="DateRange:N",
-    )
-
-    layers = [bars, date_labels]
-
-    if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
-        today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
-            color="red", strokeDash=[5, 4], strokeWidth=2
-        ).encode(x=alt.X("Today:T", scale=x_scale))
-        layers.append(today_rule)
-
-    gantt_chart = alt.layer(*layers).properties(height=max(150, 34 * len(gantt_df) + 60))
-    st.altair_chart(gantt_chart, use_container_width=True)
+hide_completed = st.checkbox("Filter completed", value=True, key=f"hide_comp_{selected_team}")
+render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed)
 
 # ----------------------------------------------------------------------
 # 5. Calculation Engine (daily, Sunday - Thursday)
