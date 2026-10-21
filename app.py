@@ -38,6 +38,13 @@ TEAMS = {
         "disciplines": ["Arch Design Team"],
         "engineers": [21],  # Fallback default from sheet (Total = 21)
     },
+    "BIM Team": {
+        "sheet_id": "1g9lFbLem738PcQ3FOWGjXZJopwWnf2g5-ncS6dUwNn8",
+        "gid": None,
+        "mode": "team_count",
+        "disciplines": ["BIM Team"],
+        "engineers": [3],  # Fallback default from sheet (Total = 3)
+    },
     "QC Team": {
         "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
         "gid": None,
@@ -434,7 +441,7 @@ def load_from_gsheet(url, disciplines):
 
 
 # ----------------------------------------------------------------------
-# 2b. WBS Gantt Chart page
+# 2b. WBS Gantt Chart page (Without Backup)
 # ----------------------------------------------------------------------
 def _pick_col(df, *keys):
     for c in df.columns:
@@ -630,59 +637,22 @@ def render_wbs_gantt():
     wbs_url = build_csv_url(WBS_SHEET_ID)
     st.subheader("🗓️ WBS Gantt Chart")
 
-    # Backup Controls for WBS
-    wbs_backups = list_backups("WBS_Gantt")
-    col_mode, col_date = st.columns([2, 2])
-    with col_mode:
-        data_source = st.radio(
-            "WBS Data Source:",
-            ["🟢 Live Data (Google Sheet)", "🕰️ Historical Backup"],
-            horizontal=True,
-            key="wbs_data_source"
-        )
-    with col_date:
-        selected_b_date = None
-        if data_source == "🕰️ Historical Backup":
-            if wbs_backups:
-                selected_b_date = st.selectbox("Select Snapshot Date:", wbs_backups, key="wbs_b_date")
-            else:
-                st.info("No WBS backups found yet.")
-
-    col_a, col_b, col_c = st.columns([1.2, 1.2, 2.6])
+    col_a, col_b = st.columns([1.5, 3])
     with col_a:
         if st.button("🔄 Refresh Live Sheet", use_container_width=True):
             load_wbs.clear()
             st.rerun()
     with col_b:
-        save_wbs_btn = st.button("💾 Save Backup Now", use_container_width=True)
-    with col_c:
         st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{WBS_SHEET_ID}/edit")
 
-    # Load Data
-    live_df = None
+    # Load Data directly from Google Sheet (without backup)
     try:
-        live_df = load_wbs(wbs_url)
-        # Auto-backup daily if in live mode
-        save_daily_backup("WBS_Gantt", live_df)
+        df = load_wbs(wbs_url)
     except Exception as e:
-        if data_source == "🟢 Live Data (Google Sheet)":
-            st.error(f"Could not read the WBS Google Sheet ({e}).")
-            return
+        st.error(f"Could not read the WBS Google Sheet ({e}).")
+        return
 
-    if save_wbs_btn and live_df is not None:
-        save_daily_backup("WBS_Gantt", live_df)
-        st.success("✅ Current WBS snapshot saved successfully to backups!")
-
-    if data_source == "🕰️ Historical Backup" and selected_b_date:
-        df, _ = load_backup("WBS_Gantt", selected_b_date)
-        if df is None:
-            st.error("Could not load selected backup file.")
-            return
-        st.info(f"Viewing historical WBS snapshot from: **{selected_b_date}**")
-    else:
-        df = live_df
-
-    if df is None:
+    if df is None or df.empty:
         st.error("No WBS data available.")
         return
 
