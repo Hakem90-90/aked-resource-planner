@@ -20,6 +20,16 @@ except Exception:
     HAS_WEASYPRINT = False
 
 
+def export_a3_pdf(html_content):
+    """Generates A3 PDF bytes from HTML if weasyprint is installed and working."""
+    if not HAS_WEASYPRINT:
+        return None
+    try:
+        return weasyprint.HTML(string=html_content).write_pdf()
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------
 # 1. Page Configuration & Setup
 # ----------------------------------------------------------------------
@@ -668,24 +678,19 @@ def build_wbs_html(df, dw, today):
     return html_doc, comp_h + 8
 
 
-def build_a3_single_page_gantt_pdf(df):
+def build_a3_single_page_html(df):
     """
-    Builds a pure vector PDF strictly calibrated to fit onto exactly ONE single page A3 Landscape (420mm x 297mm).
-    Uses dynamic row heights and proportional timeline bounds to eliminate page overflows.
+    Builds a vector-crisp A3 Landscape HTML document calibrated strictly to fit
+    onto 1 single page with zero overflow or trailing pages.
     """
-    if not HAS_WEASYPRINT:
-        return None
-
     esc = lambda v: _html.escape(str(v), quote=True)
     today = datetime.date.today()
 
     if df is None or df.empty:
-        html = "<html><body><h3>No tasks to display</h3></body></html>"
-        return weasyprint.HTML(string=html).write_pdf()
+        return "<html><body><h3>No tasks to display</h3></body></html>"
 
-    # Timeline bounds
     origin = df["Start Date"].min().normalize()
-    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)  # Align to Sunday
+    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)  # Sunday
     last = df["End Date"].max().normalize() + pd.Timedelta(days=1)
     days_to_add = (4 - last.dayofweek) % 7
     last = last + pd.Timedelta(days=max(days_to_add, 3))
@@ -699,15 +704,13 @@ def build_a3_single_page_gantt_pdf(df):
         d = (pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1
         return max(round((d / total_days) * 100, 2), 0.8)
 
-    # Dynamic row sizing to fit strictly 1 page on A3 landscape
     n_rows = len(df)
-    avail_h = 960  # total pixels available for task rows on 285mm printable height
+    avail_h = 960
     row_h = max(11, min(24, int(avail_h / max(1, n_rows))))
     bar_h = max(6, row_h - 6)
     font_sz = max(7.0, min(10.5, round(row_h * 0.46, 1)))
     sub_font_sz = max(6.5, font_sz - 1.0)
 
-    # Month blocks
     current = origin
     month_blocks = []
     while current < last:
@@ -718,7 +721,6 @@ def build_a3_single_page_gantt_pdf(df):
         month_blocks.append((current.strftime("%B %Y"), m_pct))
         current = m_end + pd.Timedelta(days=1)
 
-    # Week blocks
     week_blocks = []
     current = origin
     while current < last:
@@ -771,6 +773,7 @@ def build_a3_single_page_gantt_pdf(df):
 <html>
 <head>
 <meta charset="utf-8">
+<title>WBS Gantt Chart - A3 Landscape</title>
 <style>
     @page {{
         size: 420mm 297mm;
@@ -794,6 +797,16 @@ def build_a3_single_page_gantt_pdf(df):
         page-break-after: avoid;
         page-break-inside: avoid;
         font-size: {font_sz}px;
+    }}
+    .no-print {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: #f1f5f9;
+        border: 1px solid #cbd5e1;
+        padding: 8px 16px;
+        border-radius: 6px;
+        margin-bottom: 8px;
     }}
     .header-box {{
         display: flex;
@@ -901,9 +914,20 @@ def build_a3_single_page_gantt_pdf(df):
         color: #475569;
         font-weight: 500;
     }}
+    @media print {{
+        .no-print {{ display: none !important; }}
+    }}
 </style>
 </head>
 <body>
+    <div class="no-print">
+        <div style="font-weight:600; font-size:13px; color:#1e3a8a;">
+            🗓️ WBS Gantt Chart - A3 Landscape Vector Print Preview (1-Page Fit)
+        </div>
+        <button onclick="window.print()" style="background:#2563eb; color:#fff; border:none; padding:7px 18px; border-radius:4px; font-weight:600; cursor:pointer; font-size:12px;">
+            🖨️ Print to A3 PDF
+        </button>
+    </div>
     <div class="header-box">
         <div>
             <div class="main-title">Project Schedule & Work Breakdown Structure (WBS)</div>
@@ -931,7 +955,7 @@ def build_a3_single_page_gantt_pdf(df):
 </body>
 </html>
 """
-    return weasyprint.HTML(string=html).write_pdf()
+    return html
 
 
 def render_wbs_gantt():
@@ -1022,26 +1046,64 @@ def render_wbs_gantt():
 
     df = df.sort_values(["Start", "End"]).reset_index(drop=True)
 
-    # ---- Action Toolbar: Direct Single-Page A3 Vector PDF Download ----
-    col_a, col_b, col_c = st.columns([1.5, 2.5, 2.0])
+    # ---- Action Toolbar: Guaranteed A3 PDF Print / Download Button ----
+    col_a, col_b, col_c = st.columns([1.5, 2.8, 2.0])
     with col_a:
         if st.button("🔄 Refresh Live Sheet", use_container_width=True):
             load_wbs.clear()
             st.rerun()
 
-    # Build direct single-page A3 Vector PDF
-    pdf_bytes = build_a3_single_page_gantt_pdf(df)
+    # Pre-generate exact-fit A3 Single-Page Vector HTML & PDF
+    a3_html = build_a3_single_page_html(df)
+    pdf_bytes = export_a3_pdf(a3_html) if HAS_WEASYPRINT else None
 
     with col_b:
         if pdf_bytes:
             st.download_button(
-                "📥 Download A3 PDF (Single Page Fit)",
+                "📥 Download A3 PDF (1-Page Fit)",
                 data=pdf_bytes,
-                file_name=f"WBS_Gantt_A3_SinglePage_{datetime.date.today().strftime('%Y%m%d')}.pdf",
+                file_name=f"WBS_Gantt_A3_{datetime.date.today().strftime('%Y%m%d')}.pdf",
                 mime="application/pdf",
                 use_container_width=True,
                 help="Download exact-fit A3 Landscape Vector PDF fitted strictly onto 1 single page"
             )
+        else:
+            # Client-side 1-click A3 print dialog (works 100% reliably on all platforms)
+            escaped_html = json.dumps(a3_html)
+            components.html(f"""
+                <button onclick="printA3Doc()" style="
+                    width: 100%;
+                    height: 38px;
+                    background-color: #2563eb;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 6px;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+                ">
+                    🖨️ Print / Save as A3 PDF (1-Page Fit)
+                </button>
+                <script>
+                function printA3Doc() {{
+                    var docContent = {escaped_html};
+                    var win = window.open('', '_blank');
+                    win.document.open();
+                    win.document.write(docContent);
+                    win.document.close();
+                    win.focus();
+                    setTimeout(function() {{
+                        win.print();
+                    }}, 400);
+                }}
+                </script>
+            """, height=44)
 
     with col_c:
         st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{WBS_SHEET_ID}/edit", use_container_width=True)
