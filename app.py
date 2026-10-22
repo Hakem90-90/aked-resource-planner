@@ -88,41 +88,65 @@ HOURS_PER_DAY = 8
 
 
 # ----------------------------------------------------------------------
-# 1b. Backup Management System (Daily Snapshots & Differences)
+# 1b. Backup Management System (Timestamped Snapshots & Differences)
 # ----------------------------------------------------------------------
 def _get_safe_team_name(team_name):
     return "".join(c for c in team_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
 
 
-def save_daily_backup(team_name, df, counts=None, date_str=None):
-    """Saves a daily backup CSV (and optional JSON counts)."""
-    if date_str is None:
-        date_str = datetime.date.today().isoformat()
+def save_backup(team_name, df, counts=None, timestamp_str=None):
+    """Saves a backup CSV (and optional JSON counts) with timestamp."""
+    if df is None or df.empty:
+        return None
+    if timestamp_str is None:
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     safe_team = _get_safe_team_name(team_name)
-    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
+    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}.csv")
     df.to_csv(csv_path, index=False)
     if counts is not None:
-        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(counts, f, ensure_ascii=False, indent=2)
-    return csv_path
+        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}_counts.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(counts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return timestamp_str
+
+
+save_daily_backup = save_backup
 
 
 def list_backups(team_name):
-    """Lists available backup dates in descending order."""
+    """Lists available backup identifiers in descending order (newest first)."""
     safe_team = _get_safe_team_name(team_name)
-    pattern = os.path.join(BACKUP_DIR, f"{safe_team}_*.csv")
+    prefix = f"{safe_team}_"
+    pattern = os.path.join(BACKUP_DIR, f"{prefix}*.csv")
     files = glob.glob(pattern)
     dates = []
     for f in files:
         base = os.path.basename(f)
-        date_part = base.replace(f"{safe_team}_", "").replace(".csv", "")
-        dates.append(date_part)
+        if base.startswith(prefix) and base.endswith(".csv"):
+            date_part = base[len(prefix):-4]
+            if not date_part.endswith("_counts"):
+                dates.append(date_part)
     return sorted(list(set(dates)), reverse=True)
 
 
+def format_backup_label(b_str):
+    """Nicely formats backup timestamp string for selectboxes."""
+    if not b_str:
+        return ""
+    if "_" in b_str and len(b_str) >= 19:
+        parts = b_str.split("_", 1)
+        time_part = parts[1].replace("-", ":")
+        return f"{parts[0]}  at  {time_part}"
+    return b_str
+
+
 def load_backup(team_name, date_str):
-    """Loads dataframe and counts from a specified backup date."""
+    """Loads dataframe and counts from a specified backup identifier."""
+    if not date_str:
+        return None, {}
     safe_team = _get_safe_team_name(team_name)
     csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
     json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
@@ -186,12 +210,12 @@ def compare_datasets(current_df, backup_df, disciplines):
         s_old, s_new = r_back.get("Start Date"), r_curr.get("Start Date")
         e_old, e_new = r_back.get("End Date"), r_curr.get("End Date")
 
-        if pd.notnull(s_old) and pd.notnull(s_new) and s_old != s_new:
+        if pd.notnull(s_old) and pd.notnull(s_new) and str(s_old) != str(s_new):
             diffs.append(f"Start: {s_old} ➔ {s_new}")
         elif pd.isnull(s_old) != pd.isnull(s_new):
             diffs.append(f"Start: {s_old} ➔ {s_new}")
 
-        if pd.notnull(e_old) and pd.notnull(e_new) and e_old != e_new:
+        if pd.notnull(e_old) and pd.notnull(e_new) and str(e_old) != str(e_new):
             diffs.append(f"End: {e_old} ➔ {e_new}")
         elif pd.isnull(e_old) != pd.isnull(e_new):
             diffs.append(f"End: {e_old} ➔ {e_new}")
@@ -908,7 +932,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
 
     # Main horizontal bar layer
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
-        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
+        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=250)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
         color=alt.Color("Project:N", legend=None),
@@ -951,7 +975,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
 
 
 # ----------------------------------------------------------------------
-# 2d. Main View: All 4 Teams Gantt Charts in One Page
+# 2d. Main View: All 4 Teams Gantt Charts in One Page (2 Side-by-Side)
 # ----------------------------------------------------------------------
 def render_main_overview():
     st.subheader("🗓️ Project Timelines - Main Overview (All Teams)")
@@ -963,22 +987,54 @@ def render_main_overview():
         if st.button("🔄 Refresh All Sheets", use_container_width=True):
             load_from_gsheet.clear()
             load_team_counts.clear()
+            st.session_state["refresh_all_backup"] = True
             st.rerun()
 
+    do_backup_all = st.session_state.pop("refresh_all_backup", False)
+    if do_backup_all:
+        st.toast("🔄 Refreshing all sheets and archiving backups...")
+
     team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
-    for t_name in team_order:
-        if t_name not in TEAMS:
-            continue
-        cfg = TEAMS[t_name]
-        st.markdown(f"### 👥 {t_name} - Project Timeline")
-        try:
-            csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
-            team_df, _ = load_from_gsheet(csv_url, cfg["disciplines"])
-            team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
-            render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
-        except Exception as e:
-            st.error(f"Could not load data for {t_name}: {e}")
+    valid_teams = [t for t in team_order if t in TEAMS]
+
+    # Render pairs of 2 teams side-by-side
+    for i in range(0, len(valid_teams), 2):
+        pair = valid_teams[i:i + 2]
+        cols = st.columns(2)
+        for col_idx, t_name in enumerate(pair):
+            with cols[col_idx]:
+                cfg = TEAMS[t_name]
+                st.markdown(f"### 👥 {t_name}")
+                try:
+                    csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
+                    team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"])
+                    
+                    # Also fetch team counts tab if configured
+                    if cfg.get("count_sheet") or cfg.get("count_gid") is not None:
+                        if cfg.get("count_gid") is not None:
+                            c_url = build_csv_url(cfg["sheet_id"], cfg["count_gid"])
+                        else:
+                            c_url = build_sheet_name_url(cfg["sheet_id"], cfg["count_sheet"])
+                        try:
+                            tab_c = load_team_counts(c_url, cfg["disciplines"])
+                            if tab_c:
+                                team_counts = tab_c
+                        except Exception:
+                            pass
+
+                    # Auto-backup on Refresh All or if no backup exists yet
+                    if do_backup_all or not list_backups(t_name):
+                        if team_df is not None and not team_df.empty:
+                            save_backup(t_name, team_df, team_counts)
+
+                    team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
+                    render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
+                except Exception as e:
+                    st.error(f"Could not load data for {t_name}: {e}")
         st.markdown("---")
+
+    if do_backup_all:
+        st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
 
 
 # ----------------------------------------------------------------------
@@ -1003,9 +1059,41 @@ SHEET_ID = team_cfg["sheet_id"]
 CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 
 # ----------------------------------------------------------------------
-# 2e. Data Source Selection & Daily Backup Controls
+# 2e. Data Source Selection & Automatic Backup Controls
 # ----------------------------------------------------------------------
 st.markdown("---")
+
+# Check if a refresh was triggered
+do_refresh_backup = st.session_state.pop(f"refresh_backup_{selected_team}", False)
+
+# Fetch Live Data
+live_projects = None
+live_eng_counts = {}
+try:
+    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
+    if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
+        if team_cfg.get("count_gid") is not None:
+            c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
+        else:
+            c_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
+        try:
+            tab_c = load_team_counts(c_url, disciplines)
+            if tab_c:
+                live_eng_counts = tab_c
+        except Exception:
+            pass
+
+    # Save backup automatically upon refresh, or on initial run if no backups exist yet
+    if (do_refresh_backup or not list_backups(selected_team)) and live_projects is not None and not live_projects.empty:
+        new_ts = save_backup(selected_team, live_projects, live_eng_counts)
+        if do_refresh_backup:
+            st.toast(f"✅ Auto-backup archived on refresh: {format_backup_label(new_ts)}")
+
+except Exception as e:
+    st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
+    live_projects = get_empty_template(team_mode, disciplines)
+
+# List available backups after ensuring initial/refresh backup is saved
 available_backups = list_backups(selected_team)
 
 c_mode, c_hist, c_actions = st.columns([1.8, 1.8, 2.8])
@@ -1014,7 +1102,7 @@ with c_mode:
         "📂 Data Source:",
         ["🟢 Live Google Sheet", "🕰️ Historical Backup"],
         horizontal=True,
-        help="Choose whether to load current live data from Google Sheet or load a previous day's snapshot."
+        help="Choose whether to load current live data from Google Sheet or load a previous snapshot."
     )
 
 selected_backup_date = None
@@ -1022,8 +1110,9 @@ with c_hist:
     if data_source == "🕰️ Historical Backup":
         if available_backups:
             selected_backup_date = st.selectbox(
-                "📅 Select Backup Snapshot Date:",
+                "📅 Select Backup Snapshot:",
                 available_backups,
+                format_func=format_backup_label,
                 index=0
             )
         else:
@@ -1044,57 +1133,48 @@ if refresh_clicked:
     load_team_counts.clear()
     for d in disciplines:
         st.session_state.pop(f"eng_{selected_team}_{d}", None)
+    st.session_state[f"refresh_backup_{selected_team}"] = True
     st.rerun()
 
-# Fetch Live Data
-live_projects = None
-live_eng_counts = {}
-try:
-    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
-    if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
-        if team_cfg.get("count_gid") is not None:
-            c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
-        else:
-            c_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
-        try:
-            tab_c = load_team_counts(c_url, disciplines)
-            if tab_c:
-                live_eng_counts = tab_c
-        except Exception:
-            pass
-
-    save_daily_backup(selected_team, live_projects, live_eng_counts)
-except Exception as e:
-    if data_source == "🟢 Live Google Sheet":
-        st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
-        live_projects = get_empty_template(team_mode, disciplines)
-
 if save_backup_now and live_projects is not None:
-    save_daily_backup(selected_team, live_projects, live_eng_counts)
-    st.success("✅ Current state successfully archived as today's backup snapshot!")
+    saved_ts = save_backup(selected_team, live_projects, live_eng_counts)
+    st.success(f"✅ Saved backup snapshot: {format_backup_label(saved_ts)}")
+    st.rerun()
 
 # Determine active dataset based on user selection
 counts_source = "defaults"
 if data_source == "🕰️ Historical Backup" and selected_backup_date:
     df_projects, sheet_eng_counts = load_backup(selected_team, selected_backup_date)
-    counts_source = f"Backup ({selected_backup_date})"
-    st.info(f"🕰️ **Viewing Historical Snapshot from {selected_backup_date}**. All calculations and timelines below reflect this snapshot.")
+    if df_projects is None or df_projects.empty:
+        st.warning("⚠️ Could not load backup data. Reverting to live data.")
+        df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+        sheet_eng_counts = live_eng_counts
+        counts_source = "Live Google Sheet"
+    else:
+        counts_source = f"Backup ({format_backup_label(selected_backup_date)})"
+        st.info(f"🕰️ **Viewing Historical Snapshot from {format_backup_label(selected_backup_date)}**. All calculations and timelines below reflect this snapshot.")
 else:
     df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
     sheet_eng_counts = live_eng_counts
     counts_source = "Live Google Sheet"
-    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Daily backup automatically archived).")
+    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
 
 # ----------------------------------------------------------------------
 # 2f. Differences & Change Comparison (مقارنة الفروقات)
 # ----------------------------------------------------------------------
 with st.expander("🔍 Compare Changes with a Previous Backup (مقارنة الفروقات)"):
-    if not available_backups:
+    cmp_backups = list_backups(selected_team)
+    if not cmp_backups:
         st.info("No saved backup files available to compare.")
     elif live_projects is None:
         st.warning("Live data not available to compare.")
     else:
-        cmp_date = st.selectbox("Select historical backup to compare against current live data:", available_backups, key="cmp_date")
+        cmp_date = st.selectbox(
+            "Select historical backup to compare against current live data:",
+            cmp_backups,
+            format_func=format_backup_label,
+            key="cmp_date"
+        )
         hist_df, hist_counts = load_backup(selected_team, cmp_date)
         if hist_df is not None:
             added, removed, modified = compare_datasets(live_projects, hist_df, disciplines)
@@ -1143,7 +1223,7 @@ efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(
-        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{data_source}_{selected_backup_date}_{disc}"
     )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
 
