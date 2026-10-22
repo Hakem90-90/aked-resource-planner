@@ -4,31 +4,12 @@ import json
 import datetime
 from urllib.parse import quote
 import html as _html
-import io
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 import streamlit.components.v1 as components
-
-# Optional WeasyPrint for direct server-side PDF generation
-try:
-    import weasyprint
-    HAS_WEASYPRINT = True
-except Exception:
-    HAS_WEASYPRINT = False
-
-
-def export_a3_pdf(html_content):
-    """Generates A3 PDF bytes from HTML if weasyprint is installed and working."""
-    if not HAS_WEASYPRINT:
-        return None
-    try:
-        return weasyprint.HTML(string=html_content).write_pdf()
-    except Exception:
-        return None
-
 
 # ----------------------------------------------------------------------
 # 1. Page Configuration & Setup
@@ -484,7 +465,7 @@ def load_from_gsheet(url, disciplines):
 
 
 # ----------------------------------------------------------------------
-# 2b. WBS Gantt Chart: Interactive View & Single-Page A3 Vector PDF Builder
+# 2b. WBS Gantt Chart page (Without Backup)
 # ----------------------------------------------------------------------
 def _pick_col(df, *keys):
     for c in df.columns:
@@ -678,291 +659,19 @@ def build_wbs_html(df, dw, today):
     return html_doc, comp_h + 8
 
 
-def build_a3_single_page_html(df):
-    """
-    Builds a vector-crisp A3 Landscape HTML document calibrated strictly to fit
-    onto 1 single page with zero overflow or trailing pages.
-    """
-    esc = lambda v: _html.escape(str(v), quote=True)
-    today = datetime.date.today()
-
-    if df is None or df.empty:
-        return "<html><body><h3>No tasks to display</h3></body></html>"
-
-    origin = df["Start Date"].min().normalize()
-    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)  # Sunday
-    last = df["End Date"].max().normalize() + pd.Timedelta(days=1)
-    days_to_add = (4 - last.dayofweek) % 7
-    last = last + pd.Timedelta(days=max(days_to_add, 3))
-    total_days = max(7, int((last - origin).days))
-
-    def get_pos(dt):
-        d = (pd.Timestamp(dt).normalize() - origin).days
-        return round((d / total_days) * 100, 2)
-
-    def get_width(s, e):
-        d = (pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1
-        return max(round((d / total_days) * 100, 2), 0.8)
-
-    n_rows = len(df)
-    avail_h = 960
-    row_h = max(11, min(24, int(avail_h / max(1, n_rows))))
-    bar_h = max(6, row_h - 6)
-    font_sz = max(7.0, min(10.5, round(row_h * 0.46, 1)))
-    sub_font_sz = max(6.5, font_sz - 1.0)
-
-    current = origin
-    month_blocks = []
-    while current < last:
-        next_month = (current.replace(day=1) + pd.Timedelta(days=32)).replace(day=1)
-        m_end = min(next_month - pd.Timedelta(days=1), last - pd.Timedelta(days=1))
-        m_days = (m_end - current).days + 1
-        m_pct = round((m_days / total_days) * 100, 2)
-        month_blocks.append((current.strftime("%B %Y"), m_pct))
-        current = m_end + pd.Timedelta(days=1)
-
-    week_blocks = []
-    current = origin
-    while current < last:
-        w_end = min(current + pd.Timedelta(days=6), last - pd.Timedelta(days=1))
-        w_days = (w_end - current).days + 1
-        w_pct = round((w_days / total_days) * 100, 2)
-        week_blocks.append((current.strftime("%d %b"), w_pct))
-        current = current + pd.Timedelta(days=7)
-
-    color_palette = [
-        "#2563eb", "#d97706", "#059669", "#7c3aed", "#dc2626", 
-        "#0891b2", "#4f46e5", "#b45309", "#0284c7", "#65a30d"
-    ]
-    stages = df["Stage"].unique() if "Stage" in df.columns else ["Default"]
-    stage_colors = {s: color_palette[i % len(color_palette)] for i, s in enumerate(stages)}
-
-    table_rows_html = ""
-    for idx, r in df.iterrows():
-        col = stage_colors.get(r.get("Stage"), "#2563eb")
-        left_pct = get_pos(r["Start Date"])
-        w_pct = get_width(r["Start Date"], r["End Date"])
-        s_str = r["Start Date"].strftime("%d-%b-%Y")
-        e_str = r["End Date"].strftime("%d-%b-%Y")
-        code_str = str(r.get("Code", ""))
-        task_str = str(r.get("Task", f"Task {idx+1}"))
-        disc_str = str(r.get("Disc", "-"))
-        days_str = str(r.get("WorkDays", ""))
-        resp_str = str(r.get("Resp", ""))
-
-        table_rows_html += f"""
-        <div class="g-row">
-            <div class="c-col c-code">{esc(code_str)}</div>
-            <div class="c-col c-name" title="{esc(task_str)}">{esc(task_str)}</div>
-            <div class="c-col c-date">{s_str}</div>
-            <div class="c-col c-date">{e_str}</div>
-            <div class="c-col c-days">{days_str}</div>
-            <div class="c-col c-disc">{esc(disc_str)}</div>
-            <div class="c-timeline-cell">
-                <div class="g-bar" style="left:{left_pct}%; width:{w_pct}%; background:{col};">
-                    <span class="g-bar-label">{esc(resp_str)}</span>
-                </div>
-            </div>
-        </div>
-        """
-
-    m_hdr_html = "".join([f'<div class="hdr-cell" style="width:{pct}%;">{lbl}</div>' for lbl, pct in month_blocks])
-    w_hdr_html = "".join([f'<div class="hdr-cell" style="width:{pct}%; font-size:{sub_font_sz}px;">{lbl}</div>' for lbl, pct in week_blocks])
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>WBS Gantt Chart - A3 Landscape</title>
-<style>
-    @page {{
-        size: 420mm 297mm;
-        margin: 6mm 8mm;
-    }}
-    *, *:before, *:after {{
-        box-sizing: border-box;
-        -webkit-print-color-adjust: exact !important;
-        print-color-adjust: exact !important;
-    }}
-    html, body {{
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        color: #1e293b;
-        background: #fff;
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 285mm;
-        max-height: 285mm;
-        overflow: hidden;
-        page-break-after: avoid;
-        page-break-inside: avoid;
-        font-size: {font_sz}px;
-    }}
-    .no-print {{
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: #f1f5f9;
-        border: 1px solid #cbd5e1;
-        padding: 8px 16px;
-        border-radius: 6px;
-        margin-bottom: 8px;
-    }}
-    .header-box {{
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-end;
-        border-bottom: 2px solid #1e3a8a;
-        padding-bottom: 4px;
-        margin-bottom: 5px;
-        height: 32px;
-    }}
-    .main-title {{
-        font-size: 16px;
-        font-weight: 700;
-        color: #1e3a8a;
-        line-height: 1.1;
-    }}
-    .sub-title {{
-        font-size: 9px;
-        color: #64748b;
-    }}
-    .stats-box {{
-        font-size: 9px;
-        color: #334155;
-        text-align: right;
-    }}
-    .g-container {{
-        width: 100%;
-        border: 1px solid #cbd5e1;
-        border-radius: 3px;
-        background: #fff;
-        page-break-inside: avoid;
-    }}
-    .g-header {{
-        display: flex;
-        background: #f8fafc;
-        border-bottom: 1.5px solid #94a3b8;
-        font-weight: 600;
-        color: #334155;
-        height: 32px;
-    }}
-    .c-col {{
-        padding: 0 4px;
-        border-right: 1px solid #e2e8f0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        flex: none;
-        display: flex;
-        align-items: center;
-    }}
-    .c-code {{ width: 44px; justify-content: center; color: #64748b; }}
-    .c-name {{ width: 230px; font-weight: 600; color: #0f172a; }}
-    .c-date {{ width: 70px; justify-content: center; }}
-    .c-days {{ width: 36px; justify-content: center; }}
-    .c-disc {{ width: 80px; }}
-    .c-timeline-hdr {{
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-    }}
-    .hdr-row {{
-        display: flex;
-        width: 100%;
-        border-bottom: 1px solid #e2e8f0;
-        height: 16px;
-        align-items: center;
-    }}
-    .hdr-row:last-child {{ border-bottom: none; }}
-    .hdr-cell {{
-        text-align: center;
-        border-right: 1px solid #e2e8f0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        height: 100%;
-        line-height: 16px;
-        font-size: {sub_font_sz}px;
-    }}
-    .g-row {{
-        display: flex;
-        border-bottom: 1px solid #f1f5f9;
-        height: {row_h}px;
-        align-items: center;
-        page-break-inside: avoid;
-    }}
-    .g-row:nth-child(even) {{ background: #fafafa; }}
-    .c-timeline-cell {{
-        flex: 1;
-        height: 100%;
-        position: relative;
-    }}
-    .g-bar {{
-        position: absolute;
-        top: {max(2, (row_h - bar_h)//2)}px;
-        height: {bar_h}px;
-        border-radius: 2px;
-        white-space: nowrap;
-    }}
-    .g-bar-label {{
-        position: absolute;
-        left: calc(100% + 4px);
-        top: 0;
-        line-height: {bar_h}px;
-        font-size: {sub_font_sz}px;
-        color: #475569;
-        font-weight: 500;
-    }}
-    @media print {{
-        .no-print {{ display: none !important; }}
-    }}
-</style>
-</head>
-<body>
-    <div class="no-print">
-        <div style="font-weight:600; font-size:13px; color:#1e3a8a;">
-            🗓️ WBS Gantt Chart - A3 Landscape Vector Print Preview (1-Page Fit)
-        </div>
-        <button onclick="window.print()" style="background:#2563eb; color:#fff; border:none; padding:7px 18px; border-radius:4px; font-weight:600; cursor:pointer; font-size:12px;">
-            🖨️ Print to A3 PDF
-        </button>
-    </div>
-    <div class="header-box">
-        <div>
-            <div class="main-title">Project Schedule & Work Breakdown Structure (WBS)</div>
-            <div class="sub-title">Engineering Resource Planner | Single Page A3 Landscape Vector PDF | Generated: {today.strftime('%d-%b-%Y')}</div>
-        </div>
-        <div class="stats-box">
-            Tasks: <strong>{n_rows}</strong> &nbsp;|&nbsp; Timeline: <strong>{origin.strftime('%d-%b-%Y')}</strong> to <strong>{last.strftime('%d-%b-%Y')}</strong>
-        </div>
-    </div>
-    <div class="g-container">
-        <div class="g-header">
-            <div class="c-col c-code">WBS</div>
-            <div class="c-col c-name">Task Name</div>
-            <div class="c-col c-date">Start Date</div>
-            <div class="c-col c-date">End Date</div>
-            <div class="c-col c-days">Days</div>
-            <div class="c-col c-disc">Department</div>
-            <div class="c-timeline-hdr">
-                <div class="hdr-row">{m_hdr_html}</div>
-                <div class="hdr-row">{w_hdr_html}</div>
-            </div>
-        </div>
-        {table_rows_html}
-    </div>
-</body>
-</html>
-"""
-    return html
-
-
 def render_wbs_gantt():
     wbs_url = build_csv_url(WBS_SHEET_ID)
     st.subheader("🗓️ WBS Gantt Chart")
 
-    # Load Data directly from Google Sheet
+    col_a, col_b = st.columns([1.5, 3])
+    with col_a:
+        if st.button("🔄 Refresh Live Sheet", use_container_width=True):
+            load_wbs.clear()
+            st.rerun()
+    with col_b:
+        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{WBS_SHEET_ID}/edit")
+
+    # Load Data directly from Google Sheet (without backup)
     try:
         df = load_wbs(wbs_url)
     except Exception as e:
@@ -1038,7 +747,6 @@ def render_wbs_gantt():
 
     code = df[code_col].astype(str) if code_col else pd.Series([""] * len(df), index=df.index)
     task = df[task_col].astype(str) if task_col else pd.Series(["Task"] * len(df), index=df.index)
-    df["Code"] = code
     df["Task"] = (code + " · " + task).str.strip(" ·")
     df["Stage"] = df[stage_col].astype(str) if stage_col else "-"
     df["Disc"] = df[disc_col].astype(str) if disc_col else "-"
@@ -1046,68 +754,7 @@ def render_wbs_gantt():
 
     df = df.sort_values(["Start", "End"]).reset_index(drop=True)
 
-    # ---- Action Toolbar: Guaranteed A3 PDF Print / Download Button ----
-    col_a, col_b, col_c = st.columns([1.5, 2.8, 2.0])
-    with col_a:
-        if st.button("🔄 Refresh Live Sheet", use_container_width=True):
-            load_wbs.clear()
-            st.rerun()
-
-    # Pre-generate exact-fit A3 Single-Page Vector HTML & PDF
-    a3_html = build_a3_single_page_html(df)
-    pdf_bytes = export_a3_pdf(a3_html) if HAS_WEASYPRINT else None
-
-    with col_b:
-        if pdf_bytes:
-            st.download_button(
-                "📥 Download A3 PDF (1-Page Fit)",
-                data=pdf_bytes,
-                file_name=f"WBS_Gantt_A3_{datetime.date.today().strftime('%Y%m%d')}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                help="Download exact-fit A3 Landscape Vector PDF fitted strictly onto 1 single page"
-            )
-        else:
-            # Client-side 1-click A3 print dialog (works 100% reliably on all platforms)
-            escaped_html = json.dumps(a3_html)
-            components.html(f"""
-                <button onclick="printA3Doc()" style="
-                    width: 100%;
-                    height: 38px;
-                    background-color: #2563eb;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    font-size: 13.5px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 6px;
-                    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
-                ">
-                    🖨️ Print / Save as A3 PDF (1-Page Fit)
-                </button>
-                <script>
-                function printA3Doc() {{
-                    var docContent = {escaped_html};
-                    var win = window.open('', '_blank');
-                    win.document.open();
-                    win.document.write(docContent);
-                    win.document.close();
-                    win.focus();
-                    setTimeout(function() {{
-                        win.print();
-                    }}, 400);
-                }}
-                </script>
-            """, height=44)
-
-    with col_c:
-        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{WBS_SHEET_ID}/edit", use_container_width=True)
-
+    # ---- Summary metrics ----
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Tasks", len(df))
     m2.metric("First start", f"{df['Start Date'].min():%d-%b-%Y}")
@@ -1119,7 +766,8 @@ def render_wbs_gantt():
                                    weekmask=NP_WEEKMASK))),
     )
 
-    # Interactive Web View Gantt
+    # ---- MS Project style Gantt ----
+    df["Code"] = code
     html_doc, comp_h = build_wbs_html(df, zoom, today)
     components.html(html_doc, height=comp_h, scrolling=False)
 
@@ -1349,9 +997,6 @@ def render_main_overview():
     team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
     valid_teams = [t for t in team_order if t in TEAMS]
 
-    all_completed_projects = []
-    today = datetime.date.today()
-
     # Render pairs of 2 teams side-by-side
     for i in range(0, len(valid_teams), 2):
         pair = valid_teams[i:i + 2]
@@ -1384,110 +1029,12 @@ def render_main_overview():
 
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
-
-                    # Collect completed projects for this team
-                    name_col = find_name_col(team_calc_df)
-                    for _, r in team_calc_df.iterrows():
-                        e_date = r.get("End Date")
-                        if pd.notnull(e_date):
-                            if isinstance(e_date, str):
-                                e_date = pd.to_datetime(e_date, errors="coerce").date()
-                            elif isinstance(e_date, pd.Timestamp):
-                                e_date = e_date.date()
-
-                            if e_date and e_date < today:
-                                p_label = make_project_label(r, name_col)
-                                all_completed_projects.append({
-                                    "Project Name": p_label,
-                                    "End Date": e_date,
-                                    "Department": t_name,
-                                })
-
                 except Exception as e:
                     st.error(f"Could not load data for {t_name}: {e}")
         st.markdown("---")
 
     if do_backup_all:
         st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
-
-    # ------------------------------------------------------------------
-    # Completed Projects Section (English Interface & Date Range Filters)
-    # ------------------------------------------------------------------
-    st.subheader("🏁 Completed Projects Register")
-
-    if not all_completed_projects:
-        st.info("No completed projects recorded across any team.")
-    else:
-        comp_df = pd.DataFrame(all_completed_projects)
-
-        min_date = comp_df["End Date"].min()
-        max_date = comp_df["End Date"].max()
-
-        f_col1, f_col2, f_col3 = st.columns([1.6, 1, 1])
-        with f_col1:
-            selected_teams = st.multiselect(
-                "👥 Filter by Department / Team:",
-                options=valid_teams,
-                default=valid_teams,
-                key="completed_team_filter"
-            )
-        with f_col2:
-            start_date_filter = st.date_input(
-                "📅 End Date (From):",
-                value=min_date,
-                key="completed_start_date"
-            )
-        with f_col3:
-            end_date_filter = st.date_input(
-                "📅 End Date (To):",
-                value=max_date,
-                key="completed_end_date"
-            )
-
-        if start_date_filter > end_date_filter:
-            st.warning("⚠️ Start Date must be before or equal to End Date.")
-            filtered_comp = pd.DataFrame(columns=["Project Name", "End Date", "Department"])
-        else:
-            mask = (
-                (comp_df["Department"].isin(selected_teams)) &
-                (comp_df["End Date"] >= start_date_filter) &
-                (comp_df["End Date"] <= end_date_filter)
-            )
-            filtered_comp = comp_df[mask].sort_values("End Date", ascending=False).reset_index(drop=True)
-
-        # Summary metrics
-        metric_cols = st.columns(len(selected_teams) + 1)
-        metric_cols[0].metric("📊 Total Completed", len(filtered_comp))
-        for idx, t in enumerate(selected_teams):
-            t_count = len(filtered_comp[filtered_comp["Department"] == t])
-            metric_cols[idx + 1].metric(f"{t}", t_count)
-
-        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-
-        # Tabs for unified view and per-team breakdown
-        tab_labels = [f"📋 All Departments ({len(filtered_comp)})"] + [
-            f"👥 {t} ({len(filtered_comp[filtered_comp['Department'] == t])})"
-            for t in selected_teams
-        ]
-        comp_tabs = st.tabs(tab_labels)
-
-        with comp_tabs[0]:
-            if filtered_comp.empty:
-                st.info("No completed projects match the selected filter criteria.")
-            else:
-                st.dataframe(
-                    filtered_comp[["Project Name", "End Date", "Department"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-        for idx, t in enumerate(selected_teams):
-            with comp_tabs[idx + 1]:
-                t_sub = filtered_comp[filtered_comp["Department"] == t][["Project Name", "End Date"]]
-                if t_sub.empty:
-                    st.info(f"No completed projects for {t} within the selected date range.")
-                else:
-                    st.dataframe(t_sub, use_container_width=True, hide_index=True)
 
 
 # ----------------------------------------------------------------------
@@ -1613,9 +1160,9 @@ else:
     st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
 
 # ----------------------------------------------------------------------
-# 2f. Differences & Change Comparison
+# 2f. Differences & Change Comparison (مقارنة الفروقات)
 # ----------------------------------------------------------------------
-with st.expander("🔍 Compare Changes with a Previous Backup"):
+with st.expander("🔍 Compare Changes with a Previous Backup (مقارنة الفروقات)"):
     cmp_backups = list_backups(selected_team)
     if not cmp_backups:
         st.info("No saved backup files available to compare.")
