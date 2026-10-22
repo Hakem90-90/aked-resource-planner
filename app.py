@@ -997,6 +997,9 @@ def render_main_overview():
     team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
     valid_teams = [t for t in team_order if t in TEAMS]
 
+    all_completed_projects = []
+    today = datetime.date.today()
+
     # Render pairs of 2 teams side-by-side
     for i in range(0, len(valid_teams), 2):
         pair = valid_teams[i:i + 2]
@@ -1029,12 +1032,110 @@ def render_main_overview():
 
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
+
+                    # Collect completed projects for this team
+                    name_col = find_name_col(team_calc_df)
+                    for _, r in team_calc_df.iterrows():
+                        e_date = r.get("End Date")
+                        if pd.notnull(e_date):
+                            if isinstance(e_date, str):
+                                e_date = pd.to_datetime(e_date, errors="coerce").date()
+                            elif isinstance(e_date, pd.Timestamp):
+                                e_date = e_date.date()
+
+                            if e_date and e_date < today:
+                                p_label = make_project_label(r, name_col)
+                                all_completed_projects.append({
+                                    "اسم المشروع": p_label,
+                                    "تاريخ الانتهاء": e_date,
+                                    "القسم المعني": t_name,
+                                })
+
                 except Exception as e:
                     st.error(f"Could not load data for {t_name}: {e}")
         st.markdown("---")
 
     if do_backup_all:
         st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
+
+    # ------------------------------------------------------------------
+    # Completed Projects Section (قائمة المشاريع المنجزة)
+    # ------------------------------------------------------------------
+    st.subheader("🏁 قائمة المشاريع المنجزة (Completed Projects)")
+
+    if not all_completed_projects:
+        st.info("لا توجد مشاريع منتهية حالياً في أي قسم.")
+    else:
+        comp_df = pd.DataFrame(all_completed_projects)
+
+        min_date = comp_df["تاريخ الانتهاء"].min()
+        max_date = comp_df["تاريخ الانتهاء"].max()
+
+        f_col1, f_col2, f_col3 = st.columns([1.6, 1, 1])
+        with f_col1:
+            selected_teams = st.multiselect(
+                "👥 تصفية بحسب القسم المعني:",
+                options=valid_teams,
+                default=valid_teams,
+                key="completed_team_filter"
+            )
+        with f_col2:
+            start_date_filter = st.date_input(
+                "📅 تاريخ الانتهاء (من):",
+                value=min_date,
+                key="completed_start_date"
+            )
+        with f_col3:
+            end_date_filter = st.date_input(
+                "📅 تاريخ الانتهاء (إلى):",
+                value=max_date,
+                key="completed_end_date"
+            )
+
+        if start_date_filter > end_date_filter:
+            st.warning("⚠️ تاريخ البدء يجب أن يكون قبل أو يساوي تاريخ الانتهاء.")
+            filtered_comp = pd.DataFrame(columns=["اسم المشروع", "تاريخ الانتهاء", "القسم المعني"])
+        else:
+            mask = (
+                (comp_df["القسم المعني"].isin(selected_teams)) &
+                (comp_df["تاريخ الانتهاء"] >= start_date_filter) &
+                (comp_df["تاريخ الانتهاء"] <= end_date_filter)
+            )
+            filtered_comp = comp_df[mask].sort_values("تاريخ الانتهاء", ascending=False).reset_index(drop=True)
+
+        # Summary metrics
+        metric_cols = st.columns(len(selected_teams) + 1)
+        metric_cols[0].metric("📊 إجمالي المنجز", len(filtered_comp))
+        for idx, t in enumerate(selected_teams):
+            t_count = len(filtered_comp[filtered_comp["القسم المعني"] == t])
+            metric_cols[idx + 1].metric(f"{t}", t_count)
+
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+        # Tabs for unified view and per-team breakdown
+        tab_labels = [f"📋 جميع الأقسام ({len(filtered_comp)})"] + [
+            f"👥 {t} ({len(filtered_comp[filtered_comp['القسم المعني'] == t])})"
+            for t in selected_teams
+        ]
+        comp_tabs = st.tabs(tab_labels)
+
+        with comp_tabs[0]:
+            if filtered_comp.empty:
+                st.info("لا توجد مشاريع منجزة تطابق معايير الفلترة المحددة.")
+            else:
+                st.dataframe(
+                    filtered_comp[["اسم المشروع", "تاريخ الانتهاء", "القسم المعني"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        for idx, t in enumerate(selected_teams):
+            with comp_tabs[idx + 1]:
+                t_sub = filtered_comp[filtered_comp["القسم المعني"] == t][["اسم المشروع", "تاريخ الانتهاء"]]
+                if t_sub.empty:
+                    st.info(f"لا توجد مشاريع منجزة لـ {t} ضمن نطاق التاريخ المحدد.")
+                else:
+                    st.dataframe(t_sub, use_container_width=True, hide_index=True)
 
 
 # ----------------------------------------------------------------------
