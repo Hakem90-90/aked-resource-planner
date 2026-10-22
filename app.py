@@ -534,7 +534,7 @@ def build_wbs_html(df, dw, today):
         return int((pd.Timestamp(ts).normalize() - origin).days * dw)
 
     def w_of(s, e):
-        return max(int(((pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1) * dw), 4)
+        return max(int(((pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1) * dw), 6)
 
     fmt = lambda t: pd.Timestamp(t).strftime("%a %d-%b-%y")
 
@@ -565,6 +565,8 @@ def build_wbs_html(df, dw, today):
         col = color_of[stage]
         s_all, e_all = g["Start Date"].min(), g["End Date"].max()
         wd_all = int(np.busday_count(s_all.date(), e_all.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+        if s_all.date() == e_all.date() and wd_all == 0:
+            wd_all = 1
 
         left_rows.append(
             f'<div class="lrow stage">'
@@ -698,6 +700,8 @@ def render_wbs_gantt():
     for s, e in zip(df["Start Date"], df["End Date"]):
         s_d, e_d = s.date(), e.date()
         wd = int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+        if s_d == e_d and wd == 0:
+            wd = 1
         s_fix = pd.Timestamp(np.busday_offset(s_d, 0, roll="forward", weekmask=NP_WEEKMASK))
         e_fix = pd.Timestamp(np.busday_offset(e_d, 0, roll="backward", weekmask=NP_WEEKMASK))
         on_weekend = (s.dayofweek in (4, 5)) or (e.dayofweek in (4, 5))
@@ -733,9 +737,9 @@ def render_wbs_gantt():
     m3.metric("Last end", f"{df['End Date'].max():%d-%b-%Y}")
     m4.metric(
         "Working days (Sun-Thu)",
-        int(np.busday_count(df["Start Date"].min().date(),
-                            df["End Date"].max().date() + datetime.timedelta(days=1),
-                            weekmask=NP_WEEKMASK)),
+        max(1, int(np.busday_count(df["Start Date"].min().date(),
+                                   df["End Date"].max().date() + datetime.timedelta(days=1),
+                                   weekmask=NP_WEEKMASK))),
     )
 
     # ---- MS Project style Gantt ----
@@ -768,7 +772,7 @@ def find_name_col(df):
     skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
     for c in df.columns:
         low = str(c).lower()
-        if c not in skip and any(k in low for k in ("name", "project", "contract")):
+        if c not in skip and any(k in low for k in ("name", "project", "contract", "task")):
             return c
     for c in df.columns:
         if c not in skip and df[c].dtype == object:
@@ -793,20 +797,39 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
     calc_df = df.copy()
     count_col = find_count_col(calc_df)
 
+    # Ensure Start and End Date are safe date objects and handle missing dates
+    calc_df["Start Date"] = pd.to_datetime(calc_df["Start Date"], errors="coerce").dt.date
+    calc_df["End Date"] = pd.to_datetime(calc_df["End Date"], errors="coerce").dt.date
+    calc_df["End Date"] = calc_df["End Date"].fillna(calc_df["Start Date"])
+    calc_df["Start Date"] = calc_df["Start Date"].fillna(calc_df["End Date"])
+
     if team_mode == "team_count":
         hrs_col_name = f"{disciplines[0]} (Hrs)"
         sheet_hrs_col = find_calc_hrs_col(calc_df)
 
-        if sheet_hrs_col is not None:
-            calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
-        elif count_col is not None:
+        calc_from_count = False
+        if sheet_hrs_col is not None and sheet_hrs_col in calc_df.columns:
+            calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce")
+            # If values in Calculated Hours are missing or 0, calculate dynamically
+            if calc_df[hrs_col_name].isna().all() or (calc_df[hrs_col_name] == 0).all():
+                calc_from_count = True
+            else:
+                calc_df[hrs_col_name] = calc_df[hrs_col_name].fillna(0)
+        else:
+            calc_from_count = True
+
+        if calc_from_count and count_col is not None and count_col in calc_df.columns:
             calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
-            work_days = [
-                0 if (pd.isnull(s_d) or pd.isnull(e_d))
-                else max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)))
-                for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"])
-            ]
-            calc_df[hrs_col_name] = calc_df[count_col] * work_days * hours_per_day
+            work_days = []
+            for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"]):
+                if pd.isnull(s_d) or pd.isnull(e_d):
+                    work_days.append(0)
+                else:
+                    wd = int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+                    if s_d == e_d and wd == 0:
+                        wd = 1
+                    work_days.append(max(0, wd))
+            calc_df[hrs_col_name] = calc_df[count_col] * pd.Series(work_days, index=calc_df.index) * hours_per_day
 
     return calc_df, count_col
 
@@ -816,6 +839,11 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     gantt_df = calc_df.copy()
     gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
     gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
+
+    # If End Date was omitted or empty, set to Start Date
+    gantt_df["End"] = gantt_df["End"].fillna(gantt_df["Start"])
+    gantt_df["Start"] = gantt_df["Start"].fillna(gantt_df["End"])
+
     gantt_df = gantt_df.dropna(subset=["Start", "End"])
     gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
 
@@ -829,20 +857,38 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
 
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
+
+    # Prevent Altair from grouping projects with identical names onto the same row
+    if gantt_df["Project"].duplicated().any():
+        seen = {}
+        unique_labels = []
+        for p in gantt_df["Project"]:
+            count = seen.get(p, 0) + 1
+            seen[p] = count
+            unique_labels.append(f"{p} ({count})" if count > 1 else p)
+        gantt_df["Project"] = unique_labels
+
+    # 1-day tasks must have EndPlus = End + 1 day so the bar spans the full day
     gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
     gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
-    gantt_df["WorkDays"] = [
-        int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-        for s, e in zip(gantt_df["Start"], gantt_df["End"])
-    ]
+
+    def _calc_workdays(s, e):
+        try:
+            wd = int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+            return max(wd, 1) if s.date() == e.date() else wd
+        except Exception:
+            return 1
+
+    gantt_df["WorkDays"] = [_calc_workdays(s, e) for s, e in zip(gantt_df["Start"], gantt_df["End"])]
     gantt_df = gantt_df.sort_values(["Start", "End"])
     gantt_df["DateRange"] = [
-        f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}" for s, e in zip(gantt_df["Start"], gantt_df["End"])
+        f"{s:%d-%b-%Y}" if s.date() == e.date() else f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}"
+        for s, e in zip(gantt_df["Start"], gantt_df["End"])
     ]
     project_order = gantt_df["Project"].tolist()
 
     x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
-    span_days = (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days
+    span_days = max(1, (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days)
     x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
     x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
@@ -851,20 +897,35 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
         extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
 
+    tooltip_items = [
+        alt.Tooltip("Project:N", title="Project"),
+        alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
+        alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
+        alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
+        alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
+        *extra_tooltips,
+    ]
+
+    # Main horizontal bar layer
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
         y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
         color=alt.Color("Project:N", legend=None),
-        tooltip=[
-            alt.Tooltip("Project:N", title="Project"),
-            alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
-            alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
-            alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
-            alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
-            *extra_tooltips,
-        ],
+        tooltip=tooltip_items,
     )
+
+    # Highlight same-day tasks with diamond marker so they stand out clearly regardless of timeline zoom
+    same_day_df = gantt_df[gantt_df["Start"].dt.date == gantt_df["End"].dt.date]
+    point_layer = None
+    if not same_day_df.empty:
+        point_layer = alt.Chart(same_day_df).mark_point(
+            size=120, shape="diamond", filled=True, color="#d9480f"
+        ).encode(
+            y=alt.Y("Project:N", sort=project_order),
+            x=alt.X("Start:T", scale=x_scale),
+            tooltip=tooltip_items,
+        )
 
     date_labels = alt.Chart(gantt_df).mark_text(
         align="left", baseline="middle", dx=6, fontSize=11
@@ -874,7 +935,10 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         text="DateRange:N",
     )
 
-    layers = [bars, date_labels]
+    layers = [bars]
+    if point_layer is not None:
+        layers.append(point_layer)
+    layers.append(date_labels)
 
     if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
         today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
@@ -894,7 +958,7 @@ def render_main_overview():
 
     col_f1, col_f2 = st.columns([2, 2])
     with col_f1:
-        hide_comp = st.checkbox("Filter completed", value=True, key="main_hide_comp")
+        hide_comp = st.checkbox("Filter completed", value=False, key="main_hide_comp")
     with col_f2:
         if st.button("🔄 Refresh All Sheets", use_container_width=True):
             load_from_gsheet.clear()
@@ -987,7 +1051,6 @@ live_projects = None
 live_eng_counts = {}
 try:
     live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
-    # Also fetch team counts tab if configured
     if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
         if team_cfg.get("count_gid") is not None:
             c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
@@ -1000,7 +1063,6 @@ try:
         except Exception:
             pass
 
-    # Automatically keep a daily backup on every live fetch
     save_daily_backup(selected_team, live_projects, live_eng_counts)
 except Exception as e:
     if data_source == "🟢 Live Google Sheet":
@@ -1114,7 +1176,7 @@ calc_df, count_col = prepare_calc_df(edited_df, team_mode, disciplines, hours_pe
 st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
 
-hide_completed = st.checkbox("Filter completed", value=True, key=f"hide_comp_{selected_team}")
+hide_completed = st.checkbox("Filter completed", value=False, key=f"hide_comp_{selected_team}")
 render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed)
 
 # ----------------------------------------------------------------------
@@ -1141,10 +1203,20 @@ for idx, row in calc_df.iterrows():
 
     s_date = row["Start Date"]
     e_date = row["End Date"]
+    if isinstance(s_date, str):
+        s_date = pd.to_datetime(s_date, errors="coerce").date()
+    if isinstance(e_date, str):
+        e_date = pd.to_datetime(e_date, errors="coerce").date()
+
+    if not s_date or not e_date:
+        continue
 
     workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)
     if workdays_total <= 0:
-        continue
+        if s_date == e_date:
+            workdays_total = 1
+        else:
+            continue
 
     for disc in disciplines:
         col_name = f"{disc} (Hrs)"
