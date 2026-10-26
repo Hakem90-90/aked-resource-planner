@@ -1,17 +1,23 @@
+import os
+import glob
+import json
+import datetime
+from urllib.parse import quote
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime
 import altair as alt
-from urllib.parse import quote
-import html as _html
-import streamlit.components.v1 as components
+
 
 # ----------------------------------------------------------------------
-# 1. Page Configuration
+# 1. Page Configuration & Setup
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
+
+BACKUP_DIR = "backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
 TEAMS = {
@@ -19,9 +25,8 @@ TEAMS = {
         "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
         "gid": None,
         "mode": "hours",
-        # NEW: engineers count is read from the "team count" tab (not the database tab)
-        "count_sheet": "team count",   # اسم التبويب
-        "count_gid": None,             # اختياري: ضع رقم gid للتبويب إذا أردت استخدامه بدل الاسم
+        "count_sheet": "team count",
+        "count_gid": None,
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
         "engineers": [17, 12, 5, 6, 12],  # Fallback defaults (Total = 52)
     },
@@ -32,6 +37,13 @@ TEAMS = {
         "disciplines": ["Arch Design Team"],
         "engineers": [21],  # Fallback default from sheet (Total = 21)
     },
+    "BIM Team": {
+        "sheet_id": "1g9lFbLem738PcQ3FOWGjXZJopwWnf2g5-ncS6dUwNn8",
+        "gid": None,
+        "mode": "team_count",
+        "disciplines": ["BIM Team"],
+        "engineers": [3],  # Fallback default from sheet (Total = 3)
+    },
     "QC Team": {
         "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
         "gid": None,
@@ -41,9 +53,7 @@ TEAMS = {
     },
 }
 
-# ----- NEW: Gantt Chart option (WBS file) -----
-GANTT_OPTION = "Gantt Chart"
-WBS_SHEET_ID = "1kjQtf7UkFNrgn0imyqAlYEzTPzUbR5evY5lQ8alZUIQ"
+MAIN_OPTION = "Main"
 
 
 def build_csv_url(sheet_id, gid=None):
@@ -69,14 +79,172 @@ DATA_COLS = list({
 }) + ["Calculated Hours"]
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
-# numpy weekmask order is Mon Tue Wed Thu Fri Sat Sun
 NP_WEEKMASK = "1111001"
 PD_WEEKMASK = "Sun Mon Tue Wed Thu"
 HOURS_PER_DAY = 8
 
 
 # ----------------------------------------------------------------------
-# 2. Load data from Google Sheet (read-only, refreshed every 60 seconds)
+# 1b. Backup Management System (Timestamped Snapshots & Differences)
+# ----------------------------------------------------------------------
+def _get_safe_team_name(team_name):
+    return "".join(c for c in team_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+
+
+def save_backup(team_name, df, counts=None, timestamp_str=None):
+    """Saves a backup CSV (and optional JSON counts) with timestamp."""
+    if df is None or df.empty:
+        return None
+    if timestamp_str is None:
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_team = _get_safe_team_name(team_name)
+    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}.csv")
+    df.to_csv(csv_path, index=False)
+    if counts is not None:
+        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}_counts.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(counts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return timestamp_str
+
+
+save_daily_backup = save_backup
+
+
+def list_backups(team_name):
+    """Lists available backup identifiers in descending order (newest first)."""
+    safe_team = _get_safe_team_name(team_name)
+    prefix = f"{safe_team}_"
+    pattern = os.path.join(BACKUP_DIR, f"{prefix}*.csv")
+    files = glob.glob(pattern)
+    dates = []
+    for f in files:
+        base = os.path.basename(f)
+        if base.startswith(prefix) and base.endswith(".csv"):
+            date_part = base[len(prefix):-4]
+            if not date_part.endswith("_counts"):
+                dates.append(date_part)
+    return sorted(list(set(dates)), reverse=True)
+
+
+def format_backup_label(b_str):
+    """Nicely formats backup timestamp string for selectboxes."""
+    if not b_str:
+        return ""
+    if "_" in b_str and len(b_str) >= 19:
+        parts = b_str.split("_", 1)
+        time_part = parts[1].replace("-", ":")
+        return f"{parts[0]}  at  {time_part}"
+    return b_str
+
+
+def load_backup(team_name, date_str):
+    """Loads dataframe and counts from a specified backup identifier."""
+    if not date_str:
+        return None, {}
+    safe_team = _get_safe_team_name(team_name)
+    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
+    json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
+    if not os.path.exists(csv_path):
+        return None, {}
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.astype(str).str.strip()
+    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
+    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
+    for c in df.columns:
+        if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    counts = {}
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                counts = json.load(f)
+        except Exception:
+            pass
+    return df, counts
+
+
+def compare_datasets(current_df, backup_df, disciplines):
+    """Identifies added, removed, and modified projects between current and backup data."""
+    def _make_key(row):
+        no_val = str(row.get("No.", "")).strip() if pd.notnull(row.get("No.")) else ""
+        name_val = ""
+        for k in ("project name", "project", "name", "task"):
+            col = next((c for c in row.index if k in str(c).lower()), None)
+            if col and pd.notnull(row.get(col)):
+                name_val = str(row.get(col)).strip()
+                break
+        if no_val and no_val not in ("nan", ""):
+            return f"No. {no_val} | {name_val}" if name_val else f"No. {no_val}"
+        return name_val or "Unnamed"
+
+    curr = current_df.copy()
+    back = backup_df.copy()
+    curr["_key"] = curr.apply(_make_key, axis=1)
+    back["_key"] = back.apply(_make_key, axis=1)
+
+    curr_dict = {r["_key"]: r for _, r in curr.iterrows()}
+    back_dict = {r["_key"]: r for _, r in back.iterrows()}
+
+    curr_keys = set(curr_dict.keys())
+    back_keys = set(back_dict.keys())
+
+    added_keys = sorted(list(curr_keys - back_keys))
+    removed_keys = sorted(list(back_keys - curr_keys))
+    common_keys = sorted(list(curr_keys & back_keys))
+
+    changes = []
+    hrs_cols = [f"{d} (Hrs)" for d in disciplines]
+
+    for k in common_keys:
+        r_curr = curr_dict[k]
+        r_back = back_dict[k]
+        diffs = []
+
+        # Check dates
+        s_old, s_new = r_back.get("Start Date"), r_curr.get("Start Date")
+        e_old, e_new = r_back.get("End Date"), r_curr.get("End Date")
+
+        if pd.notnull(s_old) and pd.notnull(s_new) and str(s_old) != str(s_new):
+            diffs.append(f"Start: {s_old} ➔ {s_new}")
+        elif pd.isnull(s_old) != pd.isnull(s_new):
+            diffs.append(f"Start: {s_old} ➔ {s_new}")
+
+        if pd.notnull(e_old) and pd.notnull(e_new) and str(e_old) != str(e_new):
+            diffs.append(f"End: {e_old} ➔ {e_new}")
+        elif pd.isnull(e_old) != pd.isnull(e_new):
+            diffs.append(f"End: {e_old} ➔ {e_new}")
+
+        # Check hours
+        for h_col in hrs_cols:
+            if h_col in r_curr and h_col in r_back:
+                v_old = pd.to_numeric(r_back[h_col], errors="coerce") or 0.0
+                v_new = pd.to_numeric(r_curr[h_col], errors="coerce") or 0.0
+                if abs(v_old - v_new) > 0.01:
+                    disc_name = h_col.replace(" (Hrs)", "")
+                    diffs.append(f"{disc_name} Hrs: {v_old:g} ➔ {v_new:g}")
+
+        # Check Team Count / Calculated Hours if present
+        for spec_col in ["Team Count", "Calculated Hours"]:
+            if spec_col in r_curr and spec_col in r_back:
+                v_old = pd.to_numeric(r_back[spec_col], errors="coerce") or 0.0
+                v_new = pd.to_numeric(r_curr[spec_col], errors="coerce") or 0.0
+                if abs(v_old - v_new) > 0.01:
+                    diffs.append(f"{spec_col}: {v_old:g} ➔ {v_new:g}")
+
+        if diffs:
+            changes.append({
+                "Project": k,
+                "Differences Detected": " | ".join(diffs)
+            })
+
+    return added_keys, removed_keys, changes
+
+
+# ----------------------------------------------------------------------
+# 2. Load data from Google Sheet
 # ----------------------------------------------------------------------
 def get_empty_template(mode="hours", disciplines=None):
     today = datetime.date.today()
@@ -101,7 +269,6 @@ def get_empty_template(mode="hours", disciplines=None):
 
 
 def match_discipline_name(raw_name, disciplines):
-    """يربط اسم التخصص في جدول الإكسيل باسم التخصص المعتمد في الكود (بما في ذلك MECH -> MEP)"""
     raw_low = str(raw_name).strip().lower()
     if not raw_low or "total" in raw_low:
         return None
@@ -135,10 +302,6 @@ def _to_int(v):
 
 
 def extract_counts_from_grid(grid, disciplines):
-    """
-    يقرأ صفحة "team count" كشبكة خام: لكل خلية تطابق اسم تخصص،
-    يأخذ أول رقم على يمينها في نفس الصف (أو أسفلها في نفس العمود إذا كان الجدول أفقياً).
-    """
     counts = {}
     n_rows, n_cols = grid.shape
     for r in range(n_rows):
@@ -151,7 +314,6 @@ def extract_counts_from_grid(grid, disciplines):
                 continue
 
             val = None
-            # 1) to the right (same row)
             for c2 in range(c + 1, n_cols):
                 nxt = grid.iat[r, c2]
                 if pd.isnull(nxt):
@@ -161,7 +323,7 @@ def extract_counts_from_grid(grid, disciplines):
                     break
                 if match_discipline_name(nxt, disciplines):
                     break
-            # 2) below (same column) - horizontal layout
+
             if val is None:
                 for r2 in range(r + 1, n_rows):
                     nxt = grid.iat[r2, c]
@@ -172,6 +334,7 @@ def extract_counts_from_grid(grid, disciplines):
                         break
                     if match_discipline_name(nxt, disciplines):
                         break
+
             if val is not None:
                 counts[disc] = val
     return counts
@@ -191,7 +354,6 @@ def load_from_gsheet(url, disciplines):
     eng_counts = {}
     cols_to_drop = []
 
-    # 1. التحقق من وجود "Total Team count" في صف العناوين (كما في شيت Design Team حيث القيمة بجانبها في الصف الأول)
     col_list = list(raw_df.columns)
     for idx, c in enumerate(col_list):
         c_low = c.lower()
@@ -221,11 +383,9 @@ def load_from_gsheet(url, disciplines):
                     except (ValueError, TypeError):
                         pass
 
-    # حذف الأعمدة الجانبية الخاصة بـ Total Team count والأعمدة غير المسماة
     raw_df = raw_df.drop(columns=[c for c in cols_to_drop if c in raw_df.columns])
     raw_df = raw_df.loc[:, ~raw_df.columns.str.startswith("Unnamed")]
 
-    # 2. التحقق من جدول المهندسين الجانبي (مثل Discipline / Team و No. of Engineers في Tech و QC)
     disc_col_name = None
     eng_col_name = None
     for c in raw_df.columns:
@@ -254,9 +414,7 @@ def load_from_gsheet(url, disciplines):
 
         side_cols = [c for c in [disc_col_name, eng_col_name] if c is not None and c in raw_df.columns]
         df = raw_df.drop(columns=side_cols).copy()
-
     else:
-        # 3. حالة احتياطية: إذا كان جدول المهندسين موجوداً في أسفل الشيت تحت المشاريع
         raw_df = raw_df.dropna(how="all").reset_index(drop=True)
         split_idx = None
         disc_col_idx = None
@@ -304,692 +462,8 @@ def load_from_gsheet(url, disciplines):
 
 
 # ----------------------------------------------------------------------
-# 2b. NEW: WBS Gantt Chart page (Friday & Saturday = weekend)
+# 2c. Helper Functions for Team Gantt Charts
 # ----------------------------------------------------------------------
-def _pick_col(df, *keys):
-    for c in df.columns:
-        low = str(c).lower()
-        if any(k in low for k in keys):
-            return c
-    return None
-
-
-@st.cache_data(ttl=60, show_spinner="Loading WBS from Google Sheet...")
-def load_wbs(url):
-    df = pd.read_csv(url)
-    df.columns = df.columns.astype(str).str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    s_col = _pick_col(df, "start")
-    e_col = _pick_col(df, "end")
-    df = df.rename(columns={s_col: "Start Date", e_col: "End Date"})
-    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce")
-    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce")
-    df = df.dropna(subset=["Start Date", "End Date"]).reset_index(drop=True)
-    return df
-
-
-
-STAGE_COLORS = [
-    "#2f6fb3", "#e07b39", "#3a9d6b", "#8e5ea2", "#c9a227",
-    "#c0504d", "#3b9aa8", "#7a8b3c", "#b5649a", "#6c7a89",
-]
-
-WBS_CSS = """
-*{box-sizing:border-box}
-body{margin:0;font-family:"Segoe UI",Arial,sans-serif;font-size:12px;color:#1f2933;background:#fff}
-.wrap{overflow:auto;height:__H__px;border:1px solid #c9ced6;border-radius:4px;position:relative;background:#fff}
-.grid{display:flex;width:__GW__px}
-.left{position:sticky;left:0;z-index:6;width:__LW__px;flex:none;background:#fff;border-right:2px solid #9aa4b2}
-.right{position:relative;width:__RW__px;flex:none}
-.hdr{position:sticky;top:0;z-index:5;height:__HH__px;background:#eef1f5;border-bottom:1px solid #9aa4b2}
-.lhdr{display:flex;align-items:flex-end;height:100%}
-.lhdr div,.lrow div{padding:0 6px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex:none}
-.lhdr div{font-weight:600;height:26px;line-height:26px;border-left:1px solid #d3d8df;color:#374151}
-.lhdr div:first-child{border-left:none}
-.lrow{display:flex;height:__RH__px;border-bottom:1px solid #e3e7ec;align-items:center}
-.lrow div{line-height:__RH__px;border-left:1px solid #eef0f3}
-.lrow div:first-child{border-left:none}
-.lrow.stage{background:#e8edf3;font-weight:700}
-.lrow:hover,.rrow:hover{background:#fff8dc}
-.lrow.stage:hover{background:#dde5ee}
-.c-wbs{width:__W0__px;color:#52606d}
-.c-task{width:__W1__px}
-.c-date{width:__W2__px;text-align:left}
-.c-days{width:__W3__px;text-align:right}
-.c-dept{width:__W4__px}
-.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
-.indent{display:inline-block;width:14px}
-.trow{display:flex;height:20px;border-bottom:1px solid #d3d8df}
-.trow:last-child{border-bottom:none}
-.cell{flex:none;text-align:center;line-height:20px;overflow:hidden;white-space:nowrap;border-left:1px solid #d3d8df;font-size:11px;color:#374151}
-.mh{font-weight:600;text-align:left;padding-left:6px}
-.wh{text-align:left;padding-left:4px}
-.dh{font-size:9px;color:#52606d}
-.dh.wk{background:#d9dde3}
-.body{position:relative;height:__BH__px;background-image:linear-gradient(to right,transparent 0,transparent __D5__px,rgba(140,150,165,.20) __D5__px,rgba(140,150,165,.20) __D7__px),linear-gradient(to right,#cfd5dd 1px,transparent 1px);background-size:__D7__px 100%,__D7__px 100%;background-repeat:repeat-x}
-.rrow{position:relative;height:__RH__px;border-bottom:1px solid #e3e7ec}
-.bar{position:absolute;top:6px;height:14px;border-radius:3px;box-shadow:inset 0 -2px 0 rgba(0,0,0,.18)}
-.lbl{position:absolute;top:0;line-height:__RH__px;font-size:10.5px;color:#52606d;white-space:nowrap}
-.sum{position:absolute;top:7px;height:6px;background:#1f2933}
-.sum:before,.sum:after{content:"";position:absolute;top:6px;border-top:6px solid #1f2933;border-left:5px solid transparent;border-right:5px solid transparent}
-.sum:before{left:-1px}
-.sum:after{right:-1px}
-.today{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #e03131;z-index:3;pointer-events:none}
-"""
-
-
-def build_wbs_html(df, dw, today):
-    """MS-Project style layout: task table on the left, timeline (Gantt) on the right.
-    df must contain: Code, Task, Stage, Disc, Resp, Start Date, End Date,
-    Start, End, EndPlus (plotted dates) and WorkDays."""
-    esc = lambda v: _html.escape(str(v), quote=True)
-    ROW_H, HDR_H = 26, 60
-    W = [64, 300, 98, 98, 46, 100]   # WBS | Task | Start | End | Days | Dept
-    LW = sum(W)
-
-    # Timeline origin = a Sunday, so the Fri/Sat weekend pattern repeats every 7 days
-    origin = df["Start"].min().normalize() - pd.Timedelta(days=2)
-    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)
-    last = df["EndPlus"].max().normalize() + pd.Timedelta(days=12)
-    n_days = int((last - origin).days)
-    n_days += (-n_days) % 7
-    days = pd.date_range(origin, periods=n_days, freq="D")
-    RW = n_days * dw
-
-    def x_of(ts):
-        return int((pd.Timestamp(ts).normalize() - origin).days * dw)
-
-    def w_of(s, e):
-        return max(int(((pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1) * dw), 4)
-
-    fmt = lambda t: pd.Timestamp(t).strftime("%a %d-%b-%y")
-
-    # ---- timeline header: month / week / day ----
-    months, i = "", 0
-    while i < n_days:
-        j = i
-        while j < n_days and days[j].month == days[i].month:
-            j += 1
-        label = f"{days[i]:%B %Y}" if (j - i) * dw >= 90 else f"{days[i]:%b %y}"
-        months += f'<div class="cell mh" style="width:{(j - i) * dw}px">{label}</div>'
-        i = j
-    weeks = "".join(
-        f'<div class="cell wh" style="width:{7 * dw}px">{days[w]:%d %b}</div>' for w in range(0, n_days, 7)
-    )
-    show_num = dw >= 14
-    day_cells = "".join(
-        f'<div class="cell dh{" wk" if d.dayofweek in (4, 5) else ""}" style="width:{dw}px">'
-        f'{d.day if show_num else ""}</div>'
-        for d in days
-    )
-
-    # ---- rows ----
-    stage_order = df.groupby("Stage")["Start"].min().sort_values().index.tolist()
-    color_of = {s: STAGE_COLORS[i % len(STAGE_COLORS)] for i, s in enumerate(stage_order)}
-
-    left_rows, right_rows = [], []
-    for stage in stage_order:
-        g = df[df["Stage"] == stage].sort_values(["Start", "End"])
-        col = color_of[stage]
-        s_all, e_all = g["Start Date"].min(), g["End Date"].max()
-        wd_all = int(np.busday_count(s_all.date(), e_all.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-
-        left_rows.append(
-            f'<div class="lrow stage">'
-            f'<div class="c-wbs"></div>'
-            f'<div class="c-task" style="width:{W[1]}px" title="{esc(stage)}">'
-            f'<span class="sw" style="background:{col}"></span>{esc(stage)}</div>'
-            f'<div class="c-date">{fmt(s_all)}</div><div class="c-date">{fmt(e_all)}</div>'
-            f'<div class="c-days">{wd_all}</div><div class="c-dept"></div></div>'
-        )
-        ps, pe = g["Start"].min(), g["End"].max()
-        right_rows.append(
-            f'<div class="rrow"><div class="sum" style="left:{x_of(ps)}px;width:{w_of(ps, pe)}px" '
-            f'title="{esc(stage)}: {fmt(s_all)} → {fmt(e_all)}"></div></div>'
-        )
-
-        for _, r in g.iterrows():
-            tip = (f"{r['Code']}  {r['Task']}\n{fmt(r['Start Date'])} → {fmt(r['End Date'])}\n"
-                   f"{r['WorkDays']} working days (Sun-Thu)\nDept: {r['Disc']}\nResponsible: {r['Resp']}")
-            left_rows.append(
-                f'<div class="lrow">'
-                f'<div class="c-wbs" title="{esc(r["Code"])}">{esc(r["Code"])}</div>'
-                f'<div class="c-task" title="{esc(r["Task"])}"><span class="indent"></span>{esc(r["Task"])}</div>'
-                f'<div class="c-date">{fmt(r["Start Date"])}</div><div class="c-date">{fmt(r["End Date"])}</div>'
-                f'<div class="c-days">{r["WorkDays"]}</div>'
-                f'<div class="c-dept" title="{esc(r["Disc"])}">{esc(r["Disc"])}</div></div>'
-            )
-            bx, bw = x_of(r["Start"]), w_of(r["Start"], r["End"])
-            right_rows.append(
-                f'<div class="rrow"><div class="bar" style="left:{bx}px;width:{bw}px;background:{col}" '
-                f'title="{esc(tip)}"></div>'
-                f'<div class="lbl" style="left:{bx + bw + 6}px">{esc(r["Resp"])}</div></div>'
-            )
-
-    n_rows = len(left_rows)
-    body_h = n_rows * ROW_H
-    comp_h = min(HDR_H + body_h + 4, 720)
-
-    today_html, scroll_x = "", 0
-    if origin <= today < last:
-        tx = x_of(today) + dw // 2
-        today_html = f'<div class="today" style="left:{tx}px"></div>'
-        scroll_x = max(0, tx - 250)
-
-    col_titles = ["WBS", "Task Name", "Start", "End", "Days", "Department"]
-    col_classes = ["c-wbs", "c-task", "c-date", "c-date", "c-days", "c-dept"]
-    lhdr = "".join(
-        f'<div class="{c}" style="width:{W[k]}px">{t}</div>'
-        for k, (t, c) in enumerate(zip(col_titles, col_classes))
-    )
-
-    css = (WBS_CSS.replace("__H__", str(comp_h)).replace("__GW__", str(LW + RW))
-           .replace("__LW__", str(LW)).replace("__RW__", str(RW)).replace("__HH__", str(HDR_H))
-           .replace("__RH__", str(ROW_H)).replace("__BH__", str(body_h))
-           .replace("__D5__", str(5 * dw)).replace("__D7__", str(7 * dw))
-           .replace("__W0__", str(W[0])).replace("__W1__", str(W[1])).replace("__W2__", str(W[2]))
-           .replace("__W3__", str(W[4])).replace("__W4__", str(W[5])))
-
-    html_doc = (
-        f"<style>{css}</style><div class='wrap' id='wrap'><div class='grid'>"
-        f"<div class='left'><div class='hdr'><div class='lhdr'>{lhdr}</div></div>{''.join(left_rows)}</div>"
-        f"<div class='right'><div class='hdr'>"
-        f"<div class='trow'>{months}</div><div class='trow'>{weeks}</div><div class='trow'>{day_cells}</div></div>"
-        f"<div class='body'>{''.join(right_rows)}{today_html}</div></div>"
-        f"</div></div><script>document.getElementById('wrap').scrollLeft={scroll_x};</script>"
-    )
-    return html_doc, comp_h + 8
-
-
-def build_wbs_pdf(df, today, title="WBS Gantt Chart"):
-    """Vector PDF of the whole schedule on ONE A3 landscape page (scaled to fit)."""
-    import io
-    from reportlab.lib.pagesizes import A3, landscape
-    from reportlab.lib import colors
-    from reportlab.pdfgen import canvas
-    from reportlab.pdfbase.pdfmetrics import stringWidth
-
-    PW, PH = landscape(A3)
-    M, TITLE_H, HDR_H, FOOT_H = 28, 36, 30, 16
-    W = [52, 262, 66, 66, 30, 76]                 # WBS | Task | Start | End | Days | Dept
-    LW = sum(W)
-    TL_W = PW - 2 * M - LW                          # timeline width
-
-    # timeline range (starts on a Sunday so Fri/Sat repeat every 7 days)
-    origin = df["Start"].min().normalize() - pd.Timedelta(days=2)
-    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)
-    last = df["EndPlus"].max().normalize() + pd.Timedelta(days=18)
-    n_days = int((last - origin).days)
-    n_days += (-n_days) % 7
-    days = pd.date_range(origin, periods=n_days, freq="D")
-    dpx = TL_W / n_days
-    X0 = M + LW                                     # timeline left edge
-
-    x_of = lambda ts: X0 + (pd.Timestamp(ts).normalize() - origin).days * dpx
-    w_of = lambda s, e: max(((pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1) * dpx, 1.5)
-    fmt = lambda t: pd.Timestamp(t).strftime("%a %d-%b-%y")
-
-    # rows: ("stage", ...) / ("task", ...)
-    stage_order = df.groupby("Stage")["Start"].min().sort_values().index.tolist()
-    color_of = {s: STAGE_COLORS[i % len(STAGE_COLORS)] for i, s in enumerate(stage_order)}
-    rows = []
-    for stage in stage_order:
-        g = df[df["Stage"] == stage].sort_values(["Start", "End"])
-        s_all, e_all = g["Start Date"].min(), g["End Date"].max()
-        wd = int(np.busday_count(s_all.date(), e_all.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-        rows.append(("stage", stage, s_all, e_all, wd, g["Start"].min(), g["End"].max(), color_of[stage]))
-        for _, r in g.iterrows():
-            rows.append(("task", r, color_of[stage]))
-
-    n_rows = len(rows)
-    avail = PH - 2 * M - TITLE_H - HDR_H - FOOT_H
-    row_h = min(avail / n_rows, 22)
-    fs = max(4.5, min(8, row_h * 0.55))
-    top = PH - M - TITLE_H                           # top of header
-    body_top = top - HDR_H
-    body_bot = body_top - n_rows * row_h
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(PW, PH))
-    c.setTitle(title)
-    hexc = colors.HexColor
-
-    def fit(text, font, size, maxw):
-        text = str(text)
-        if stringWidth(text, font, size) <= maxw:
-            return text
-        while text and stringWidth(text + "...", font, size) > maxw:
-            text = text[:-1]
-        return text + "..."
-
-    # ---- title ----
-    c.setFont("Helvetica-Bold", 17)
-    c.setFillColor(hexc("#1f2933"))
-    c.drawString(M, PH - M - 16, title)
-    c.setFont("Helvetica", 8)
-    c.setFillColor(hexc("#52606d"))
-    c.drawString(M, PH - M - 29, "Grey bands = weekend (Friday & Saturday)  |  Days = working days (Sun-Thu)  |  Black bar = stage summary  |  Red dashed line = today")
-    c.drawRightString(PW - M, PH - M - 16, f"Generated: {today:%d-%b-%Y}")
-
-    # ---- header backgrounds ----
-    c.setFillColor(hexc("#eef1f5"))
-    c.rect(M, body_top, LW + TL_W, HDR_H, stroke=0, fill=1)
-
-    # ---- stage row fills ----
-    for i, row in enumerate(rows):
-        if row[0] == "stage":
-            c.setFillColor(hexc("#e8edf3"))
-            c.rect(M, body_top - (i + 1) * row_h, LW + TL_W, row_h, stroke=0, fill=1)
-
-    # ---- weekend bands (Fri & Sat) ----
-    c.saveState()
-    c.setFillColor(hexc("#8c96a5"))
-    c.setFillAlpha(0.20)
-    for k, d in enumerate(days):
-        if d.dayofweek in (4, 5):
-            c.rect(X0 + k * dpx, body_bot, dpx, body_top - body_bot + HDR_H, stroke=0, fill=1)
-    c.restoreState()
-
-    # ---- week grid lines + header labels ----
-    c.setStrokeColor(hexc("#cfd5dd"))
-    c.setLineWidth(0.4)
-    c.setFont("Helvetica", 5.5)
-    c.setFillColor(hexc("#374151"))
-    for k in range(0, n_days, 7):
-        x = X0 + k * dpx
-        c.line(x, body_bot, x, body_top)
-        c.line(x, body_top, x, body_top + HDR_H / 2)
-        lab = f"{days[k]:%d %b}" if 7 * dpx >= 24 else f"{days[k]:%d}"
-        c.drawString(x + 2, body_top + 4.5, lab)
-
-    # months row
-    c.setFont("Helvetica-Bold", 7.5)
-    i = 0
-    while i < n_days:
-        j = i
-        while j < n_days and days[j].month == days[i].month:
-            j += 1
-        x, w = X0 + i * dpx, (j - i) * dpx
-        c.setStrokeColor(hexc("#9aa4b2"))
-        c.line(x, body_top + HDR_H / 2, x, body_top + HDR_H)
-        lab = f"{days[i]:%B %Y}" if w >= 70 else (f"{days[i]:%b %y}" if w >= 34 else "")
-        c.setFillColor(hexc("#1f2933"))
-        c.drawString(x + 3, body_top + HDR_H / 2 + 5, lab)
-        i = j
-    c.setStrokeColor(hexc("#9aa4b2"))
-    c.setLineWidth(0.6)
-    c.line(X0, body_top + HDR_H / 2, X0 + TL_W, body_top + HDR_H / 2)
-
-    # ---- table header ----
-    titles = ["WBS", "Task Name", "Start", "End", "Days", "Department"]
-    x = M
-    c.setFont("Helvetica-Bold", 8)
-    c.setFillColor(hexc("#1f2933"))
-    for t, w in zip(titles, W):
-        if t == "Days":
-            c.drawRightString(x + w - 4, body_top + 11, t)
-        else:
-            c.drawString(x + 4, body_top + 11, t)
-        x += w
-
-    # ---- rows ----
-    for i, row in enumerate(rows):
-        y_top = body_top - i * row_h
-        y_bot = y_top - row_h
-        ty = y_bot + (row_h - fs) / 2 + fs * 0.18      # text baseline
-        # row separator
-        c.setStrokeColor(hexc("#d9dee5"))
-        c.setLineWidth(0.3)
-        c.line(M, y_bot, X0 + TL_W, y_bot)
-
-        if row[0] == "stage":
-            _, stage, s_all, e_all, wd, ps, pe, col = row
-            c.setFillColor(hexc(col))
-            c.rect(M + W[0] + 4, y_bot + (row_h - 6) / 2, 6, 6, stroke=0, fill=1)
-            c.setFillColor(hexc("#1f2933"))
-            c.setFont("Helvetica-Bold", fs)
-            c.drawString(M + W[0] + 14, ty, fit(stage, "Helvetica-Bold", fs, W[1] - 18))
-            c.drawString(M + W[0] + W[1] + 4, ty, fmt(s_all))
-            c.drawString(M + W[0] + W[1] + W[2] + 4, ty, fmt(e_all))
-            c.drawRightString(M + sum(W[:5]) - 4, ty, str(wd))
-            # summary bar with end triangles
-            bx, bw = x_of(ps), w_of(ps, pe)
-            bh = max(2.5, row_h * 0.22)
-            by = y_bot + (row_h - bh) / 2 + bh * 0.4
-            c.setFillColor(hexc("#1f2933"))
-            c.rect(bx, by, bw, bh, stroke=0, fill=1)
-            tri = bh * 1.1
-            for tx in (bx, bx + bw):
-                p = c.beginPath()
-                p.moveTo(tx - tri * 0.7, by + bh)
-                p.lineTo(tx + tri * 0.7, by + bh)
-                p.lineTo(tx, by + bh - tri * 1.3)
-                p.close()
-                c.drawPath(p, stroke=0, fill=1)
-        else:
-            _, r, col = row
-            c.setFillColor(hexc("#52606d"))
-            c.setFont("Helvetica", fs)
-            c.drawString(M + 4, ty, fit(r["Code"], "Helvetica", fs, W[0] - 6))
-            c.setFillColor(hexc("#1f2933"))
-            c.drawString(M + W[0] + 10, ty, fit(r["Task"], "Helvetica", fs, W[1] - 14))
-            c.drawString(M + W[0] + W[1] + 4, ty, fmt(r["Start Date"]))
-            c.drawString(M + W[0] + W[1] + W[2] + 4, ty, fmt(r["End Date"]))
-            c.drawRightString(M + sum(W[:5]) - 4, ty, str(r["WorkDays"]))
-            c.drawString(M + sum(W[:5]) + 4, ty, fit(r["Disc"], "Helvetica", fs, W[5] - 6))
-            # task bar
-            bx, bw = x_of(r["Start"]), w_of(r["Start"], r["End"])
-            bh = max(3, row_h * 0.55)
-            c.setFillColor(hexc(col))
-            c.roundRect(bx, y_bot + (row_h - bh) / 2, bw, bh, min(1.5, bh / 3), stroke=0, fill=1)
-            # responsible label (right of bar, or left if no room)
-            lab_fs = max(4, fs - 1)
-            lab = str(r["Resp"])
-            lw = stringWidth(lab, "Helvetica", lab_fs)
-            c.setFillColor(hexc("#52606d"))
-            c.setFont("Helvetica", lab_fs)
-            if bx + bw + 3 + lw <= X0 + TL_W:
-                c.drawString(bx + bw + 3, ty, lab)
-            else:
-                c.drawRightString(bx - 3, ty, lab)
-
-    # ---- column separators (table) ----
-    c.setStrokeColor(hexc("#d3d8df"))
-    c.setLineWidth(0.3)
-    x = M
-    for w in W[:-1]:
-        x += w
-        c.line(x, body_bot, x, body_top + HDR_H)
-    c.setStrokeColor(hexc("#9aa4b2"))
-    c.setLineWidth(1)
-    c.line(X0, body_bot, X0, body_top + HDR_H)
-
-    # ---- today line ----
-    if origin <= today < last:
-        tx = x_of(today) + dpx / 2
-        c.setStrokeColor(hexc("#e03131"))
-        c.setLineWidth(1.1)
-        c.setDash(3, 2)
-        c.line(tx, body_bot, tx, body_top + HDR_H)
-        c.setDash()
-        c.setFont("Helvetica-Bold", 6)
-        c.setFillColor(hexc("#e03131"))
-        c.drawCentredString(tx, body_bot - 8, "Today")
-
-    # ---- outer frame ----
-    c.setStrokeColor(hexc("#9aa4b2"))
-    c.setLineWidth(0.8)
-    c.rect(M, body_bot, LW + TL_W, body_top - body_bot + HDR_H, stroke=1, fill=0)
-    c.line(M, body_top, X0 + TL_W, body_top)
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def render_wbs_gantt():
-    wbs_url = build_csv_url(WBS_SHEET_ID)
-    st.subheader("🗓️ WBS Gantt Chart")
-
-    col_a, col_b = st.columns([1, 3])
-    with col_a:
-        if st.button("🔄 Refresh from Google Sheet", use_container_width=True):
-            load_wbs.clear()
-            st.rerun()
-    with col_b:
-        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{WBS_SHEET_ID}/edit")
-
-    try:
-        df = load_wbs(wbs_url)
-        st.success("✅ WBS data loaded from Google Sheet.")
-    except Exception as e:
-        st.error(
-            f"Could not read the WBS Google Sheet ({e}). Make sure sharing is set to "
-            "'Anyone with the link: Viewer'."
-        )
-        return
-
-    code_col = _pick_col(df, "wbs code", "code")
-    stage_col = _pick_col(df, "stage")
-    task_col = _pick_col(df, "task", "work package")
-    disc_col = _pick_col(df, "discipline")
-    resp_col = _pick_col(df, "responsible")
-
-    df = df[df["End Date"] >= df["Start Date"]].copy()
-
-    # ---- Filters ----
-    f1, f2, f3, f4 = st.columns([2, 2, 2, 1.4])
-    with f1:
-        if stage_col:
-            stages = sorted(df[stage_col].dropna().astype(str).unique())
-            sel_stages = st.multiselect("Project Stage", stages, default=stages)
-            df = df[df[stage_col].astype(str).isin(sel_stages)]
-    with f2:
-        if disc_col:
-            discs = sorted(df[disc_col].dropna().astype(str).unique())
-            sel_discs = st.multiselect("Discipline", discs, default=discs)
-            df = df[df[disc_col].astype(str).isin(sel_discs)]
-    with f3:
-        hide_done = st.checkbox("Filter completed", value=False)
-        snap = st.checkbox(
-            "Snap bars to working days (Sun-Thu)", value=True,
-            help="If a task starts or ends on Friday/Saturday, the bar is moved to the nearest working day.",
-        )
-    with f4:
-        zoom = st.select_slider("Zoom (px/day)", options=[8, 12, 16, 20, 26, 32], value=16)
-
-    today = pd.Timestamp.today().normalize()
-    if hide_done:
-        df = df[df["End Date"] >= today]
-
-    if df.empty:
-        st.info("No tasks to display with the current filters.")
-        return
-
-    # ---- Working days (Sun-Thu) ----
-    plot_start, plot_end, work_days, weekend_flag = [], [], [], []
-    for s, e in zip(df["Start Date"], df["End Date"]):
-        s_d, e_d = s.date(), e.date()
-        wd = int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-        s_fix = pd.Timestamp(np.busday_offset(s_d, 0, roll="forward", weekmask=NP_WEEKMASK))
-        e_fix = pd.Timestamp(np.busday_offset(e_d, 0, roll="backward", weekmask=NP_WEEKMASK))
-        on_weekend = (s.dayofweek in (4, 5)) or (e.dayofweek in (4, 5))  # Fri=4, Sat=5
-        if snap and s_fix <= e_fix:
-            plot_start.append(s_fix)
-            plot_end.append(e_fix)
-        else:
-            plot_start.append(s)
-            plot_end.append(e)
-        work_days.append(wd)
-        weekend_flag.append(on_weekend)
-
-    df["Start"] = plot_start
-    df["End"] = plot_end
-    df["EndPlus"] = df["End"] + pd.Timedelta(days=1)
-    df["WorkDays"] = work_days
-    df["CalendarDays"] = (df["End Date"] - df["Start Date"]).dt.days + 1
-    df["OnWeekend"] = weekend_flag
-
-    code = df[code_col].astype(str) if code_col else pd.Series([""] * len(df), index=df.index)
-    task = df[task_col].astype(str) if task_col else pd.Series(["Task"] * len(df), index=df.index)
-    df["Task"] = (code + " · " + task).str.strip(" ·")
-    df["Stage"] = df[stage_col].astype(str) if stage_col else "-"
-    df["Disc"] = df[disc_col].astype(str) if disc_col else "-"
-    df["Resp"] = df[resp_col].astype(str) if resp_col else "-"
-
-    df = df.sort_values(["Start", "End"]).reset_index(drop=True)
-    order = df["Task"].tolist()
-
-    # ---- Summary metrics ----
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Tasks", len(df))
-    m2.metric("First start", f"{df['Start Date'].min():%d-%b-%Y}")
-    m3.metric("Last end", f"{df['End Date'].max():%d-%b-%Y}")
-    m4.metric(
-        "Working days (Sun-Thu)",
-        int(np.busday_count(df["Start Date"].min().date(),
-                            df["End Date"].max().date() + datetime.timedelta(days=1),
-                            weekmask=NP_WEEKMASK)),
-    )
-    n_wk = int(df["OnWeekend"].sum())
-    if n_wk:
-        st.caption(
-            f"ℹ️ {n_wk} task(s) have a start or end date on Friday/Saturday (weekend). "
-            + ("Their bars were snapped to the nearest working day." if snap else "Bars shown with original dates.")
-        )
-
-    # ---- MS Project style Gantt ----
-    df["Code"] = code
-    html_doc, comp_h = build_wbs_html(df, zoom, today)
-    components.html(html_doc, height=comp_h, scrolling=False)
-    st.caption(
-        "Left: WBS table (Start / End / Department). Right: timeline - grey bands = weekend (Friday & Saturday), "
-        "black bars = stage summary, red dashed line = today. Hover over a bar for details. "
-        "Working days are counted Sunday to Thursday only."
-    )
-
-    # ---- PDF export: whole schedule on ONE A3 landscape page ----
-    try:
-        pdf_bytes = build_wbs_pdf(df, today)
-        st.download_button(
-            "🖨️ Download PDF (A3 - full schedule on one page)",
-            data=pdf_bytes,
-            file_name=f"WBS_Gantt_{today:%Y%m%d}.pdf",
-            mime="application/pdf",
-        )
-    except ImportError:
-        st.info("PDF export requires the 'reportlab' package. Add `reportlab` to requirements.txt.")
-
-    with st.expander("📋 Data table"):
-        show = pd.DataFrame({
-            "WBS Code": df["Code"],
-            "Stage": df["Stage"],
-            "Task": task,
-            "Department": df["Disc"],
-            "Responsible": df["Resp"],
-            "Start": df["Start Date"].dt.strftime("%a %d-%b-%Y"),
-            "End": df["End Date"].dt.strftime("%a %d-%b-%Y"),
-            "Working days (Sun-Thu)": df["WorkDays"],
-            "Calendar days": df["CalendarDays"],
-        })
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-
-# ----------------------------------------------------------------------
-# Team selection (includes the new Gantt Chart option)
-# ----------------------------------------------------------------------
-selected_team = st.radio(
-    "👥 Select Team:", list(TEAMS.keys()) + [GANTT_OPTION], horizontal=True
-)
-
-if selected_team == GANTT_OPTION:
-    render_wbs_gantt()
-    st.stop()
-
-team_cfg = TEAMS[selected_team]
-team_mode = team_cfg["mode"]
-disciplines = team_cfg["disciplines"]
-SHEET_ID = team_cfg["sheet_id"]
-CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
-
-col_a, col_b = st.columns([1, 3])
-with col_a:
-    if st.button("🔄 Refresh from Google Sheet", use_container_width=True):
-        load_from_gsheet.clear()
-        load_team_counts.clear()
-        for d in disciplines:
-            st.session_state.pop(f"eng_{selected_team}_{d}", None)
-        st.rerun()
-with col_b:
-    st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
-
-try:
-    df_projects, sheet_eng_counts = load_from_gsheet(CSV_URL, disciplines)
-    st.success(f"✅ {selected_team}: data loaded from Google Sheet.")
-except Exception as e:
-    df_projects = get_empty_template(team_mode, disciplines)
-    sheet_eng_counts = {}
-    st.error(
-        f"Could not read the {selected_team} Google Sheet ({e}). Make sure sharing is set to "
-        "'Anyone with the link: Viewer'. Showing template data instead."
-    )
-
-# ---- NEW: engineers count from the dedicated "team count" tab (Tech Team) ----
-counts_source = "database tab / defaults"
-if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
-    if team_cfg.get("count_gid") is not None:
-        counts_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
-    else:
-        counts_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
-    try:
-        tab_counts = load_team_counts(counts_url, disciplines)
-        if tab_counts:
-            sheet_eng_counts = tab_counts  # replaces any counts read from the database tab
-            counts_source = f"'{team_cfg.get('count_sheet')}' tab"
-        else:
-            st.warning(
-                "The 'team count' tab was read but no engineer counts were recognised. "
-                "Using the previous source / defaults."
-            )
-    except Exception as e:
-        st.warning(f"Could not read the 'team count' tab ({e}). Using the previous source / defaults.")
-
-# ----------------------------------------------------------------------
-# 3. Sidebar - Capacity Settings
-# ----------------------------------------------------------------------
-st.sidebar.header("⚙️ Team Capacity Settings")
-st.sidebar.caption(f"Team: **{selected_team}**")
-st.sidebar.caption(f"Engineers count source: {counts_source}")
-hours_per_day = st.sidebar.number_input(
-    "Working Hours per Day (per engineer)",
-    min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
-    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor.",
-)
-st.sidebar.markdown("Set the number of available engineers:")
-
-# استخدام أعداد المهندسين القادمة من الشيت (أو القيم الافتراضية في حال عدم وجودها)
-default_engineers = [
-    sheet_eng_counts.get(disc, fallback)
-    for disc, fallback in zip(disciplines, team_cfg["engineers"])
-]
-
-engineers = {}
-capacities = {}  # daily capacity (hours per working day)
-efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
-
-for disc, default in zip(disciplines, default_engineers):
-    engineers[disc] = st.sidebar.number_input(
-        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
-    )
-    capacities[disc] = engineers[disc] * hours_per_day * efficiency
-
-# عرض العدد الكلي للمهندسين في الفريق
-total_team_engineers = sum(engineers.values())
-st.sidebar.markdown("---")
-st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
-
-# ----------------------------------------------------------------------
-# 4. Project table (temporary edits only - not saved back to the sheet)
-# ----------------------------------------------------------------------
-st.subheader("📋 Project Register & Hours Allocation")
-st.caption("Data comes from the Google Sheet. Changes made here are temporary (for what-if analysis) and are not saved. Edit the Google Sheet itself to update the data permanently.")
-
-edited_df = st.data_editor(
-    df_projects,
-    key=f"editor_{selected_team}",
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-)
-
-# ----------------------------------------------------------------------
-# 4a. Prepare hours column in the background for Design Team (no extra UI table)
-# ----------------------------------------------------------------------
-calc_df = edited_df.copy()
-
-
 def find_count_col(df):
     for c in df.columns:
         if "count" in str(c).lower():
@@ -1007,51 +481,20 @@ def find_calc_hrs_col(df):
     return None
 
 
-count_col = find_count_col(calc_df)
-
-if team_mode == "team_count":
-    hrs_col_name = f"{disciplines[0]} (Hrs)"
-    sheet_hrs_col = find_calc_hrs_col(calc_df)
-
-    if sheet_hrs_col is not None:
-        calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce").fillna(0)
-    elif count_col is not None:
-        calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
-        work_days = [
-            0 if (pd.isnull(s_d) or pd.isnull(e_d))
-            else max(0, int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)))
-            for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"])
-        ]
-        calc_df[hrs_col_name] = calc_df[count_col] * work_days * hours_per_day
-
-# ----------------------------------------------------------------------
-# 4b. Project Timeline (Gantt Chart) - updates automatically from the table
-# ----------------------------------------------------------------------
-st.markdown("---")
-st.subheader("🗓️ Project Timeline (Gantt Chart)")
-
-# فلتر لإخفاء المهام المنتهية
-hide_completed = st.checkbox("Filter completed", value=True)
-
-
 def find_name_col(df):
-    """Find the project-name column even if the header text differs slightly."""
     skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
     for c in df.columns:
         low = str(c).lower()
-        if c not in skip and any(k in low for k in ("name", "project", "contract")):
+        if c not in skip and any(k in low for k in ("name", "project", "contract", "task")):
             return c
-    for c in df.columns:  # fallback: first text column
+    for c in df.columns:
         if c not in skip and df[c].dtype == object:
             return c
     return None
 
 
-NAME_COL = find_name_col(edited_df)
-
-
-def make_project_label(r):
-    name = r.get(NAME_COL) if NAME_COL is not None else None
+def make_project_label(r, name_col):
+    name = r.get(name_col) if name_col is not None else None
     name = str(name).strip() if pd.notnull(name) and str(name).strip() != "" else "Unnamed"
     no = r.get("No.")
     if pd.notnull(no) and str(no).strip() != "":
@@ -1063,37 +506,102 @@ def make_project_label(r):
     return name
 
 
-gantt_df = calc_df.copy()
-gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
-gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
-gantt_df = gantt_df.dropna(subset=["Start", "End"])
-gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
+def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
+    calc_df = df.copy()
+    count_col = find_count_col(calc_df)
 
-# تطبيق الفلتر: الاحتفاظ فقط بالمشاريع التي تاريخ نهايتها اليوم أو بعد اليوم
-today = pd.Timestamp.today().normalize()
-if hide_completed:
-    gantt_df = gantt_df[gantt_df["End"] >= today]
+    # Ensure Start and End Date are safe date objects and handle missing dates
+    calc_df["Start Date"] = pd.to_datetime(calc_df["Start Date"], errors="coerce").dt.date
+    calc_df["End Date"] = pd.to_datetime(calc_df["End Date"], errors="coerce").dt.date
+    calc_df["End Date"] = calc_df["End Date"].fillna(calc_df["Start Date"])
+    calc_df["Start Date"] = calc_df["Start Date"].fillna(calc_df["End Date"])
 
-if gantt_df.empty:
-    st.info("No ongoing or upcoming projects with valid dates to display.")
-else:
+    if team_mode == "team_count":
+        hrs_col_name = f"{disciplines[0]} (Hrs)"
+        sheet_hrs_col = find_calc_hrs_col(calc_df)
+
+        calc_from_count = False
+        if sheet_hrs_col is not None and sheet_hrs_col in calc_df.columns:
+            calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce")
+            # If values in Calculated Hours are missing or 0, calculate dynamically
+            if calc_df[hrs_col_name].isna().all() or (calc_df[hrs_col_name] == 0).all():
+                calc_from_count = True
+            else:
+                calc_df[hrs_col_name] = calc_df[hrs_col_name].fillna(0)
+        else:
+            calc_from_count = True
+
+        if calc_from_count and count_col is not None and count_col in calc_df.columns:
+            calc_df[count_col] = pd.to_numeric(calc_df[count_col], errors="coerce").fillna(0)
+            work_days = []
+            for s_d, e_d in zip(calc_df["Start Date"], calc_df["End Date"]):
+                if pd.isnull(s_d) or pd.isnull(e_d):
+                    work_days.append(0)
+                else:
+                    wd = int(np.busday_count(s_d, e_d + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+                    if s_d == e_d and wd == 0:
+                        wd = 1
+                    work_days.append(max(0, wd))
+            calc_df[hrs_col_name] = calc_df[count_col] * pd.Series(work_days, index=calc_df.index) * hours_per_day
+
+    return calc_df, count_col
+
+
+def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed=True):
+    name_col = find_name_col(calc_df)
+    gantt_df = calc_df.copy()
+    gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
+    gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
+
+    # If End Date was omitted or empty, set to Start Date
+    gantt_df["End"] = gantt_df["End"].fillna(gantt_df["Start"])
+    gantt_df["Start"] = gantt_df["Start"].fillna(gantt_df["End"])
+
+    gantt_df = gantt_df.dropna(subset=["Start", "End"])
+    gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
+
+    today = pd.Timestamp.today().normalize()
+    if hide_completed:
+        gantt_df = gantt_df[gantt_df["End"] >= today]
+
+    if gantt_df.empty:
+        st.info("No ongoing or upcoming projects with valid dates to display.")
+        return
+
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
-    gantt_df["Project"] = gantt_df.apply(make_project_label, axis=1)
-    gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)  # include the end day in the bar
-    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-    gantt_df["WorkDays"] = [
-        int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
-        for s, e in zip(gantt_df["Start"], gantt_df["End"])
-    ]
+    gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
+
+    # Prevent Altair from grouping projects with identical names onto the same row
+    if gantt_df["Project"].duplicated().any():
+        seen = {}
+        unique_labels = []
+        for p in gantt_df["Project"]:
+            count = seen.get(p, 0) + 1
+            seen[p] = count
+            unique_labels.append(f"{p} ({count})" if count > 1 else p)
+        gantt_df["Project"] = unique_labels
+
+    # 1-day tasks must have EndPlus = End + 1 day so the bar spans the full day
+    gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
+    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
+
+    def _calc_workdays(s, e):
+        try:
+            wd = int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+            return max(wd, 1) if s.date() == e.date() else wd
+        except Exception:
+            return 1
+
+    gantt_df["WorkDays"] = [_calc_workdays(s, e) for s, e in zip(gantt_df["Start"], gantt_df["End"])]
     gantt_df = gantt_df.sort_values(["Start", "End"])
     gantt_df["DateRange"] = [
-        f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}" for s, e in zip(gantt_df["Start"], gantt_df["End"])
+        f"{s:%d-%b-%Y}" if s.date() == e.date() else f"{s:%d-%b-%Y}  →  {e:%d-%b-%Y}"
+        for s, e in zip(gantt_df["Start"], gantt_df["End"])
     ]
     project_order = gantt_df["Project"].tolist()
 
-    # Pad the right side of the axis so the date labels next to the last bars are not cut off
     x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
-    span_days = (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days
+    span_days = max(1, (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days)
     x_max = gantt_df["EndPlus"].max() + pd.Timedelta(days=max(14, int(span_days * 0.25)))
     x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
@@ -1102,22 +610,36 @@ else:
         gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
         extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
 
+    tooltip_items = [
+        alt.Tooltip("Project:N", title="Project"),
+        alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
+        alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
+        alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
+        alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
+        *extra_tooltips,
+    ]
+
+    # Main horizontal bar layer
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
-        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=300)),
+        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=250)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
         color=alt.Color("Project:N", legend=None),
-        tooltip=[
-            alt.Tooltip("Project:N", title="Project"),
-            alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
-            alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
-            alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
-            alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
-            *extra_tooltips,
-        ],
+        tooltip=tooltip_items,
     )
 
-    # Start - End dates written right next to each bar
+    # Highlight same-day tasks with diamond marker so they stand out clearly regardless of timeline zoom
+    same_day_df = gantt_df[gantt_df["Start"].dt.date == gantt_df["End"].dt.date]
+    point_layer = None
+    if not same_day_df.empty:
+        point_layer = alt.Chart(same_day_df).mark_point(
+            size=120, shape="diamond", filled=True, color="#d9480f"
+        ).encode(
+            y=alt.Y("Project:N", sort=project_order),
+            x=alt.X("Start:T", scale=x_scale),
+            tooltip=tooltip_items,
+        )
+
     date_labels = alt.Chart(gantt_df).mark_text(
         align="left", baseline="middle", dx=6, fontSize=11
     ).encode(
@@ -1126,9 +648,11 @@ else:
         text="DateRange:N",
     )
 
-    layers = [bars, date_labels]
+    layers = [bars]
+    if point_layer is not None:
+        layers.append(point_layer)
+    layers.append(date_labels)
 
-    # Red dashed line for today (only if it falls inside the projects' date range)
     if gantt_df["Start"].min() <= today <= gantt_df["EndPlus"].max():
         today_rule = alt.Chart(pd.DataFrame({"Today": [today]})).mark_rule(
             color="red", strokeDash=[5, 4], strokeWidth=2
@@ -1137,7 +661,389 @@ else:
 
     gantt_chart = alt.layer(*layers).properties(height=max(150, 34 * len(gantt_df) + 60))
     st.altair_chart(gantt_chart, use_container_width=True)
-    st.caption("Projects are sorted by start date. The red dashed line marks today. Hover over a bar for details.")
+
+
+# ----------------------------------------------------------------------
+# 2d. Main View: All 4 Teams Gantt Charts in One Page (2 Side-by-Side)
+# ----------------------------------------------------------------------
+def render_main_overview():
+    st.subheader("🗓️ Project Timelines - Main Overview (All Teams)")
+
+    col_f1, col_f2 = st.columns([2, 2])
+    with col_f1:
+        hide_comp = st.checkbox("Filter completed", value=False, key="main_hide_comp")
+    with col_f2:
+        if st.button("🔄 Refresh All Sheets", use_container_width=True):
+            load_from_gsheet.clear()
+            load_team_counts.clear()
+            st.session_state["refresh_all_backup"] = True
+            st.rerun()
+
+    do_backup_all = st.session_state.pop("refresh_all_backup", False)
+    if do_backup_all:
+        st.toast("🔄 Refreshing all sheets and archiving backups...")
+
+    team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
+    valid_teams = [t for t in team_order if t in TEAMS]
+
+    all_completed_projects = []
+    today = datetime.date.today()
+
+    # Render pairs of 2 teams side-by-side
+    for i in range(0, len(valid_teams), 2):
+        pair = valid_teams[i:i + 2]
+        cols = st.columns(2)
+        for col_idx, t_name in enumerate(pair):
+            with cols[col_idx]:
+                cfg = TEAMS[t_name]
+                st.markdown(f"### 👥 {t_name}")
+                try:
+                    csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
+                    team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"])
+
+                    # Also fetch team counts tab if configured
+                    if cfg.get("count_sheet") or cfg.get("count_gid") is not None:
+                        if cfg.get("count_gid") is not None:
+                            c_url = build_csv_url(cfg["sheet_id"], cfg["count_gid"])
+                        else:
+                            c_url = build_sheet_name_url(cfg["sheet_id"], cfg["count_sheet"])
+                        try:
+                            tab_c = load_team_counts(c_url, cfg["disciplines"])
+                            if tab_c:
+                                team_counts = tab_c
+                        except Exception:
+                            pass
+
+                    # Auto-backup on Refresh All or if no backup exists yet
+                    if do_backup_all or not list_backups(t_name):
+                        if team_df is not None and not team_df.empty:
+                            save_backup(t_name, team_df, team_counts)
+
+                    team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
+                    render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
+
+                    # Collect completed projects for this team
+                    name_col = find_name_col(team_calc_df)
+                    for _, r in team_calc_df.iterrows():
+                        e_date = r.get("End Date")
+                        if pd.notnull(e_date):
+                            if isinstance(e_date, str):
+                                e_date = pd.to_datetime(e_date, errors="coerce").date()
+                            elif isinstance(e_date, pd.Timestamp):
+                                e_date = e_date.date()
+
+                            if e_date and e_date < today:
+                                p_label = make_project_label(r, name_col)
+                                all_completed_projects.append({
+                                    "Project Name": p_label,
+                                    "End Date": e_date,
+                                    "Department": t_name,
+                                })
+
+                except Exception as e:
+                    st.error(f"Could not load data for {t_name}: {e}")
+        st.markdown("---")
+
+    if do_backup_all:
+        st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
+
+    # ------------------------------------------------------------------
+    # Completed Projects Section (English Interface & Date Range Filters)
+    # ------------------------------------------------------------------
+    st.subheader("🏁 Completed Projects Register")
+
+    if not all_completed_projects:
+        st.info("No completed projects recorded across any team.")
+    else:
+        comp_df = pd.DataFrame(all_completed_projects)
+
+        min_date = comp_df["End Date"].min()
+        max_date = comp_df["End Date"].max()
+
+        f_col1, f_col2, f_col3 = st.columns([1.6, 1, 1])
+        with f_col1:
+            selected_teams = st.multiselect(
+                "👥 Filter by Department / Team:",
+                options=valid_teams,
+                default=valid_teams,
+                key="completed_team_filter"
+            )
+        with f_col2:
+            start_date_filter = st.date_input(
+                "📅 End Date (From):",
+                value=min_date,
+                key="completed_start_date"
+            )
+        with f_col3:
+            end_date_filter = st.date_input(
+                "📅 End Date (To):",
+                value=max_date,
+                key="completed_end_date"
+            )
+
+        if start_date_filter > end_date_filter:
+            st.warning("⚠️ Start Date must be before or equal to End Date.")
+            filtered_comp = pd.DataFrame(columns=["Project Name", "End Date", "Department"])
+        else:
+            mask = (
+                (comp_df["Department"].isin(selected_teams)) &
+                (comp_df["End Date"] >= start_date_filter) &
+                (comp_df["End Date"] <= end_date_filter)
+            )
+            filtered_comp = comp_df[mask].sort_values("End Date", ascending=False).reset_index(drop=True)
+
+        # Summary metrics
+        metric_cols = st.columns(len(selected_teams) + 1)
+        metric_cols[0].metric("📊 Total Completed", len(filtered_comp))
+        for idx, t in enumerate(selected_teams):
+            t_count = len(filtered_comp[filtered_comp["Department"] == t])
+            metric_cols[idx + 1].metric(f"{t}", t_count)
+
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+        # Tabs for unified view and per-team breakdown
+        tab_labels = [f"📋 All Departments ({len(filtered_comp)})"] + [
+            f"👥 {t} ({len(filtered_comp[filtered_comp['Department'] == t])})"
+            for t in selected_teams
+        ]
+        comp_tabs = st.tabs(tab_labels)
+
+        with comp_tabs[0]:
+            if filtered_comp.empty:
+                st.info("No completed projects match the selected filter criteria.")
+            else:
+                st.dataframe(
+                    filtered_comp[["Project Name", "End Date", "Department"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        for idx, t in enumerate(selected_teams):
+            with comp_tabs[idx + 1]:
+                t_sub = filtered_comp[filtered_comp["Department"] == t][["Project Name", "End Date"]]
+                if t_sub.empty:
+                    st.info(f"No completed projects for {t} within the selected date range.")
+                else:
+                    st.dataframe(t_sub, use_container_width=True, hide_index=True)
+
+
+# ----------------------------------------------------------------------
+# Team selection
+# ----------------------------------------------------------------------
+selected_team = st.radio(
+    "👥 Select View / Team:", [MAIN_OPTION] + list(TEAMS.keys()), horizontal=True
+)
+
+if selected_team == MAIN_OPTION:
+    render_main_overview()
+    st.stop()
+
+team_cfg = TEAMS[selected_team]
+team_mode = team_cfg["mode"]
+disciplines = team_cfg["disciplines"]
+SHEET_ID = team_cfg["sheet_id"]
+CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
+
+# ----------------------------------------------------------------------
+# 2e. Data Source Selection & Automatic Backup Controls
+# ----------------------------------------------------------------------
+st.markdown("---")
+
+# Check if a refresh was triggered
+do_refresh_backup = st.session_state.pop(f"refresh_backup_{selected_team}", False)
+
+# Fetch Live Data
+live_projects = None
+live_eng_counts = {}
+try:
+    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
+    if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
+        if team_cfg.get("count_gid") is not None:
+            c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
+        else:
+            c_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
+        try:
+            tab_c = load_team_counts(c_url, disciplines)
+            if tab_c:
+                live_eng_counts = tab_c
+        except Exception:
+            pass
+
+    # Save backup automatically upon refresh, or on initial run if no backups exist yet
+    if (do_refresh_backup or not list_backups(selected_team)) and live_projects is not None and not live_projects.empty:
+        new_ts = save_backup(selected_team, live_projects, live_eng_counts)
+        if do_refresh_backup:
+            st.toast(f"✅ Auto-backup archived on refresh: {format_backup_label(new_ts)}")
+
+except Exception as e:
+    st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
+    live_projects = get_empty_template(team_mode, disciplines)
+
+# List available backups after ensuring initial/refresh backup is saved
+available_backups = list_backups(selected_team)
+
+c_mode, c_hist, c_actions = st.columns([1.8, 1.8, 2.8])
+with c_mode:
+    data_source = st.radio(
+        "📂 Data Source:",
+        ["🟢 Live Google Sheet", "🕰️ Historical Backup"],
+        horizontal=True,
+        help="Choose whether to load current live data from Google Sheet or load a previous snapshot."
+    )
+
+selected_backup_date = None
+with c_hist:
+    if data_source == "🕰️ Historical Backup":
+        if available_backups:
+            selected_backup_date = st.selectbox(
+                "📅 Select Backup Snapshot:",
+                available_backups,
+                format_func=format_backup_label,
+                index=0
+            )
+        else:
+            st.warning("No previous backups found for this team yet.")
+
+with c_actions:
+    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1.4])
+    with c_btn1:
+        refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
+    with c_btn2:
+        save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot.")
+    with c_btn3:
+        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
+
+if refresh_clicked:
+    load_from_gsheet.clear()
+    load_team_counts.clear()
+    for d in disciplines:
+        st.session_state.pop(f"eng_{selected_team}_{d}", None)
+    st.session_state[f"refresh_backup_{selected_team}"] = True
+    st.rerun()
+
+if save_backup_now and live_projects is not None:
+    saved_ts = save_backup(selected_team, live_projects, live_eng_counts)
+    st.success(f"✅ Saved backup snapshot: {format_backup_label(saved_ts)}")
+    st.rerun()
+
+# Determine active dataset based on user selection
+counts_source = "defaults"
+if data_source == "🕰️ Historical Backup" and selected_backup_date:
+    df_projects, sheet_eng_counts = load_backup(selected_team, selected_backup_date)
+    if df_projects is None or df_projects.empty:
+        st.warning("⚠️ Could not load backup data. Reverting to live data.")
+        df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+        sheet_eng_counts = live_eng_counts
+        counts_source = "Live Google Sheet"
+    else:
+        counts_source = f"Backup ({format_backup_label(selected_backup_date)})"
+        st.info(f"🕰️ **Viewing Historical Snapshot from {format_backup_label(selected_backup_date)}**. All calculations and timelines below reflect this snapshot.")
+else:
+    df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+    sheet_eng_counts = live_eng_counts
+    counts_source = "Live Google Sheet"
+    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
+
+# ----------------------------------------------------------------------
+# 2f. Differences & Change Comparison
+# ----------------------------------------------------------------------
+with st.expander("🔍 Compare Changes with a Previous Backup"):
+    cmp_backups = list_backups(selected_team)
+    if not cmp_backups:
+        st.info("No saved backup files available to compare.")
+    elif live_projects is None:
+        st.warning("Live data not available to compare.")
+    else:
+        cmp_date = st.selectbox(
+            "Select historical backup to compare against current live data:",
+            cmp_backups,
+            format_func=format_backup_label,
+            key="cmp_date"
+        )
+        hist_df, hist_counts = load_backup(selected_team, cmp_date)
+        if hist_df is not None:
+            added, removed, modified = compare_datasets(live_projects, hist_df, disciplines)
+
+            m_c1, m_c2, m_c3 = st.columns(3)
+            m_c1.metric("🆕 New Projects Added", len(added))
+            m_c2.metric("❌ Removed / Completed", len(removed))
+            m_c3.metric("🔄 Modified Projects", len(modified))
+
+            if added:
+                st.markdown("**🆕 Projects added in current data:**")
+                st.write(", ".join(added))
+
+            if removed:
+                st.markdown("**❌ Projects present in backup but missing in current data:**")
+                st.write(", ".join(removed))
+
+            if modified:
+                st.markdown("**🔄 Detailed Project Differences (Start, End, or Allocated Hours):**")
+                st.dataframe(pd.DataFrame(modified), use_container_width=True, hide_index=True)
+
+            if not added and not removed and not modified:
+                st.success("✅ Identical: No differences detected between current data and this backup.")
+
+# ----------------------------------------------------------------------
+# 3. Sidebar - Capacity Settings
+# ----------------------------------------------------------------------
+st.sidebar.header("⚙️ Team Capacity Settings")
+st.sidebar.caption(f"Team: **{selected_team}**")
+st.sidebar.caption(f"Engineers count source: {counts_source}")
+hours_per_day = st.sidebar.number_input(
+    "Working Hours per Day (per engineer)",
+    min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
+    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor.",
+)
+st.sidebar.markdown("Set the number of available engineers:")
+
+default_engineers = [
+    sheet_eng_counts.get(disc, fallback)
+    for disc, fallback in zip(disciplines, team_cfg["engineers"])
+]
+
+engineers = {}
+capacities = {}
+efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
+
+for disc, default in zip(disciplines, default_engineers):
+    engineers[disc] = st.sidebar.number_input(
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{data_source}_{selected_backup_date}_{disc}"
+    )
+    capacities[disc] = engineers[disc] * hours_per_day * efficiency
+
+total_team_engineers = sum(engineers.values())
+st.sidebar.markdown("---")
+st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
+
+# ----------------------------------------------------------------------
+# 4. Project table
+# ----------------------------------------------------------------------
+st.subheader("📋 Project Register & Hours Allocation")
+st.caption("Changes made in this table are temporary (for what-if analysis). To preserve changes, update Google Sheets or save a backup.")
+
+edited_df = st.data_editor(
+    df_projects,
+    key=f"editor_{selected_team}_{data_source}_{selected_backup_date}",
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+)
+
+# ----------------------------------------------------------------------
+# 4a. Prepare hours column in background
+# ----------------------------------------------------------------------
+calc_df, count_col = prepare_calc_df(edited_df, team_mode, disciplines, hours_per_day)
+
+# ----------------------------------------------------------------------
+# 4b. Project Timeline (Gantt Chart)
+# ----------------------------------------------------------------------
+st.markdown("---")
+st.subheader("🗓️ Project Timeline (Gantt Chart)")
+
+hide_completed = st.checkbox("Filter completed", value=False, key=f"hide_comp_{selected_team}")
+render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed)
 
 # ----------------------------------------------------------------------
 # 5. Calculation Engine (daily, Sunday - Thursday)
@@ -1163,11 +1069,20 @@ for idx, row in calc_df.iterrows():
 
     s_date = row["Start Date"]
     e_date = row["End Date"]
+    if isinstance(s_date, str):
+        s_date = pd.to_datetime(s_date, errors="coerce").date()
+    if isinstance(e_date, str):
+        e_date = pd.to_datetime(e_date, errors="coerce").date()
 
-    # Total working days of the project (Sun-Thu only)
+    if not s_date or not e_date:
+        continue
+
     workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)
     if workdays_total <= 0:
-        continue
+        if s_date == e_date:
+            workdays_total = 1
+        else:
+            continue
 
     for disc in disciplines:
         col_name = f"{disc} (Hrs)"
@@ -1218,7 +1133,6 @@ for idx, disc in enumerate(disciplines):
             dem_list.append(dem)
             cap_list.append(cap)
 
-        # Bottleneck summary
         short_days = [(day_labels[i], v) for i, v in enumerate(var_list) if v < 0]
         if short_days:
             worst = min(short_days, key=lambda x: x[1])
