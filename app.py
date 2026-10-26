@@ -484,7 +484,7 @@ def load_from_gsheet(url, disciplines):
 
 
 # ----------------------------------------------------------------------
-# 2b. WBS Gantt Chart: Interactive View & Single-Page A3 Vector PDF Builder
+# 2b. WBS Gantt Chart: Interactive View & MS Project A3 Vector PDF Builder
 # ----------------------------------------------------------------------
 def _pick_col(df, *keys):
     for c in df.columns:
@@ -678,106 +678,440 @@ def build_wbs_html(df, dw, today):
     return html_doc, comp_h + 8
 
 
-def build_a3_single_page_html(df):
+def build_a3_single_page_html(df, schedule_title="PROJECT SCHEDULE & WORK BREAKDOWN STRUCTURE (WBS)"):
     """
-    Builds a vector-crisp A3 Landscape HTML document calibrated strictly to fit
-    onto 1 single page with zero overflow or trailing pages.
+    Builds an authentic Microsoft Project-style A3 Landscape vector HTML/PDF schedule
+    calibrated strictly to fit onto 1 single A3 page (420mm x 297mm) with zero overflow.
+    Features:
+      - Classic MS Project Entry Sheet Columns: ID, Indicator/Mode Icon, WBS, Task Name (with
+        Project Summary & Stage Summary rollup hierarchy), Duration, Start, Finish, Department, Resource Names
+      - Adaptive 3-Tier MS Project Timescale Header (Month/Quarter, Week, Day-of-Week)
+      - Full-height vertical gridlines (Months, Weeks, Fri-Sat Non-Working Weekend shading, Red Today Status Line)
+      - Authentic MS Project Summary Rollup Bars (dark charcoal bracket bars with downward triangular end-caps)
+      - Beveled vector Task Bars with elapsed progress fill, Milestone diamonds (◆), and Finish-to-Start (FS) link connectors
+      - Professional Engineering Schedule Footer & Graphical Legend Title Block
     """
     esc = lambda v: _html.escape(str(v), quote=True)
-    today = datetime.date.today()
+    today = pd.Timestamp.today().normalize()
 
     if df is None or df.empty:
         return "<html><body><h3>No tasks to display</h3></body></html>"
 
-    origin = df["Start Date"].min().normalize()
-    origin = origin - pd.Timedelta(days=(origin.dayofweek + 1) % 7)  # Sunday
-    last = df["End Date"].max().normalize() + pd.Timedelta(days=1)
-    days_to_add = (4 - last.dayofweek) % 7
-    last = last + pd.Timedelta(days=max(days_to_add, 3))
-    total_days = max(7, int((last - origin).days))
+    wdf = df.copy()
+    wdf["Start Date"] = pd.to_datetime(wdf["Start Date"], errors="coerce")
+    wdf["End Date"] = pd.to_datetime(wdf["End Date"], errors="coerce")
+    wdf = wdf.dropna(subset=["Start Date", "End Date"]).reset_index(drop=True)
+    if wdf.empty:
+        return "<html><body><h3>No valid task dates to display</h3></body></html>"
+
+    # Plot coordinates (use snapped Start/End if available, otherwise Start Date / End Date)
+    if "Start" not in wdf.columns:
+        wdf["Start"] = wdf["Start Date"]
+    else:
+        wdf["Start"] = pd.to_datetime(wdf["Start"], errors="coerce").fillna(wdf["Start Date"])
+
+    if "End" not in wdf.columns:
+        wdf["End"] = wdf["End Date"]
+    else:
+        wdf["End"] = pd.to_datetime(wdf["End"], errors="coerce").fillna(wdf["End Date"])
+
+    # Clean task name so WBS Code is not duplicated inside the Task Name column
+    raw_tasks = []
+    for _, r in wdf.iterrows():
+        c_str = str(r.get("Code", "")).strip()
+        t_str = str(r.get("Task", "")).strip()
+        if c_str and t_str.startswith(c_str):
+            cleaned = t_str[len(c_str):].lstrip(" ·-:")
+            raw_tasks.append(cleaned if cleaned else t_str)
+        else:
+            raw_tasks.append(t_str if t_str else "Task")
+    wdf["_CleanTask"] = raw_tasks
+
+    if "WorkDays" not in wdf.columns:
+        wds = []
+        for s, e in zip(wdf["Start Date"], wdf["End Date"]):
+            wd = int(np.busday_count(s.date(), e.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+            if s.date() == e.date() and wd == 0:
+                wd = 1
+            wds.append(max(1, wd))
+        wdf["WorkDays"] = wds
+
+    if "Stage" not in wdf.columns:
+        wdf["Stage"] = "Project Schedule"
+    if "Disc" not in wdf.columns:
+        wdf["Disc"] = "-"
+    if "Resp" not in wdf.columns:
+        wdf["Resp"] = ""
+    if "Code" not in wdf.columns:
+        wdf["Code"] = [str(i + 1) for i in range(len(wdf))]
+
+    # Timeline bounds aligned to Sunday (start of KSA workweek)
+    min_start = wdf["Start"].min().normalize()
+    max_end = wdf["End"].max().normalize()
+    origin = min_start - pd.Timedelta(days=(min_start.dayofweek + 1) % 7)
+    span_raw = max(7, int((max_end - origin).days) + 1)
+    right_pad_days = max(7, int(span_raw * 0.08))
+    last = max_end + pd.Timedelta(days=right_pad_days)
+    # Align `last` to Saturday (end of week) so week blocks are exact 7-day multiples
+    rem = (5 - last.dayofweek) % 7
+    last = last + pd.Timedelta(days=rem)
+    total_days = max(7, int((last - origin).days) + 1)
+    all_days = pd.date_range(origin, last, freq="D")
 
     def get_pos(dt):
         d = (pd.Timestamp(dt).normalize() - origin).days
-        return round((d / total_days) * 100, 2)
+        return round((d / total_days) * 100, 4)
 
     def get_width(s, e):
         d = (pd.Timestamp(e).normalize() - pd.Timestamp(s).normalize()).days + 1
-        return max(round((d / total_days) * 100, 2), 0.8)
+        return max(round((d / total_days) * 100, 4), 0.35)
 
-    n_rows = len(df)
-    avail_h = 960
-    row_h = max(11, min(24, int(avail_h / max(1, n_rows))))
-    bar_h = max(6, row_h - 6)
-    font_sz = max(7.0, min(10.5, round(row_h * 0.46, 1)))
-    sub_font_sz = max(6.5, font_sz - 1.0)
+    # Group by Stage in chronological order (MS Project Summary Tasks)
+    stage_order = wdf.groupby("Stage")["Start"].min().sort_values().index.tolist()
+    include_project_summary = len(stage_order) > 1
+    n_summary_rows = len(stage_order) + (1 if include_project_summary else 0)
+    n_total_rows = len(wdf) + n_summary_rows
 
-    current = origin
-    month_blocks = []
-    while current < last:
-        next_month = (current.replace(day=1) + pd.Timedelta(days=32)).replace(day=1)
-        m_end = min(next_month - pd.Timedelta(days=1), last - pd.Timedelta(days=1))
-        m_days = (m_end - current).days + 1
-        m_pct = round((m_days / total_days) * 100, 2)
-        month_blocks.append((current.strftime("%B %Y"), m_pct))
-        current = m_end + pd.Timedelta(days=1)
+    # Strict 1-Page A3 Landscape Vertical Budget
+    # Printable height on A3 Landscape (297mm - 10mm margin = 287mm)
+    # Header Banner (38px) + 3-Tier Timescale Header (42px) + Legend Footer (28px) = 108px
+    avail_h = 910
+    row_h = max(10, min(22, int(avail_h / max(1, n_total_rows))))
+    bar_h = max(5, min(13, int(row_h * 0.58)))
+    sum_bar_h = max(4, min(6, int(row_h * 0.28)))
+    font_sz = max(6.8, min(10.0, round(row_h * 0.48, 1)))
+    sub_font_sz = max(6.0, round(font_sz - 0.8, 1))
 
-    week_blocks = []
-    current = origin
-    while current < last:
-        w_end = min(current + pd.Timedelta(days=6), last - pd.Timedelta(days=1))
-        w_days = (w_end - current).days + 1
-        w_pct = round((w_days / total_days) * 100, 2)
-        week_blocks.append((current.strftime("%d %b"), w_pct))
-        current = current + pd.Timedelta(days=7)
-
-    color_palette = [
-        "#2563eb", "#d97706", "#059669", "#7c3aed", "#dc2626", 
-        "#0891b2", "#4f46e5", "#b45309", "#0284c7", "#65a30d"
+    # MS Project Stage Palette (Classic MS Project blues, emeralds, ambers, purples, teals)
+    ms_palette = [
+        ("#2b6cb0", "#1e4e8c", "#63b3ed"),  # MS Project Classic Steel Blue
+        ("#2f855a", "#22543d", "#68d391"),  # Emerald Green
+        ("#c05621", "#7b341e", "#f6ad55"),  # Warm Ochre / Orange
+        ("#6b46c1", "#44337a", "#b794f4"),  # Royal Purple
+        ("#0987a0", "#065666", "#4fd1c5"),  # Cyan / Teal
+        ("#b83280", "#702459", "#f687b3"),  # Magenta / Plum
+        ("#2c5282", "#1a365d", "#90cdf4"),  # Deep Navy Blue
+        ("#975a16", "#5f370e", "#fbd38d"),  # Goldenrod
+        ("#285e61", "#1d4044", "#81e6d9"),  # Deep Slate Teal
+        ("#742a2a", "#4a1c1c", "#feb2b2"),  # Crimson Brick
     ]
-    stages = df["Stage"].unique() if "Stage" in df.columns else ["Default"]
-    stage_colors = {s: color_palette[i % len(color_palette)] for i, s in enumerate(stages)}
+    stage_colors = {s: ms_palette[i % len(ms_palette)] for i, s in enumerate(stage_order)}
 
-    table_rows_html = ""
-    for idx, r in df.iterrows():
-        col = stage_colors.get(r.get("Stage"), "#2563eb")
-        left_pct = get_pos(r["Start Date"])
-        w_pct = get_width(r["Start Date"], r["End Date"])
-        s_str = r["Start Date"].strftime("%d-%b-%Y")
-        e_str = r["End Date"].strftime("%d-%b-%Y")
-        code_str = str(r.get("Code", ""))
-        task_str = str(r.get("Task", f"Task {idx+1}"))
-        disc_str = str(r.get("Disc", "-"))
-        days_str = str(r.get("WorkDays", ""))
-        resp_str = str(r.get("Resp", ""))
+    # Build Timescale Header Tiers:
+    # Tier 1: Months
+    month_blocks = []
+    i = 0
+    while i < total_days:
+        j = i
+        while j < total_days and all_days[j].month == all_days[i].month and all_days[j].year == all_days[i].year:
+            j += 1
+        span = j - i
+        pct = round((span / total_days) * 100, 4)
+        lbl = all_days[i].strftime("%B %Y") if pct >= 8.0 else all_days[i].strftime("%b '%y")
+        month_blocks.append((lbl, pct, round((i / total_days) * 100, 4)))
+        i = j
 
-        table_rows_html += f"""
-        <div class="g-row">
-            <div class="c-col c-code">{esc(code_str)}</div>
-            <div class="c-col c-name" title="{esc(task_str)}">{esc(task_str)}</div>
-            <div class="c-col c-date">{s_str}</div>
-            <div class="c-col c-date">{e_str}</div>
-            <div class="c-col c-days">{days_str}</div>
-            <div class="c-col c-disc">{esc(disc_str)}</div>
+    # Tier 2: Weeks (starting Sunday)
+    week_blocks = []
+    i = 0
+    while i < total_days:
+        span = min(7, total_days - i)
+        pct = round((span / total_days) * 100, 4)
+        left_p = round((i / total_days) * 100, 4)
+        if pct >= 2.4:
+            lbl = all_days[i].strftime("%d %b")
+        elif pct >= 1.2:
+            lbl = all_days[i].strftime("%d/%m")
+        else:
+            lbl = all_days[i].strftime("%d")
+        week_blocks.append((lbl, pct, left_p))
+        i += 7
+
+    # Tier 3: Daily Cells (when total_days <= 140) or Sub-Week Ticks (when total_days > 140)
+    day_letters = ["M", "T", "W", "T", "F", "S", "S"]
+    if total_days <= 140:
+        day_w_pct = round(100.0 / total_days, 4)
+        day_cells = []
+        for d in all_days:
+            is_wknd = d.dayofweek in (4, 5)  # Friday=4, Saturday=5
+            dl = day_letters[d.dayofweek] if total_days <= 98 else ""
+            wk_cls = " t-day-wknd" if is_wknd else ""
+            day_cells.append(f'<div class="t-day-cell{wk_cls}" style="width:{day_w_pct}%">{dl}</div>')
+        day_tier_html = f'<div class="hdr-row hdr-tier-days">{"".join(day_cells)}</div>'
+    else:
+        # Render week day-number sub-band so 3-tier MS Project look is preserved at all scales
+        sub_cells = [
+            f'<div class="hdr-cell hdr-subweek" style="width:{pct}%;">W{idx+1}</div>'
+            for idx, (_, pct, _) in enumerate(week_blocks)
+        ]
+        day_tier_html = f'<div class="hdr-row hdr-tier-days">{"".join(sub_cells)}</div>'
+
+    # Background vertical gridlines (Weeks, Months, Weekend shading, and Today line)
+    grid_overlays = []
+    if total_days <= 180:
+        for idx_d, d in enumerate(all_days):
+            if d.dayofweek == 4:  # Friday start of 2-day weekend
+                w_span = min(2, total_days - idx_d)
+                l_pct = round((idx_d / total_days) * 100, 4)
+                w_pct = round((w_span / total_days) * 100, 4)
+                grid_overlays.append(
+                    f'<div class="bg-wknd" style="left:{l_pct}%;width:{w_pct}%"></div>'
+                )
+
+    for _, _, left_p in week_blocks:
+        if left_p > 0:
+            grid_overlays.append(f'<div class="bg-week-line" style="left:{left_p}%"></div>')
+
+    for _, _, left_p in month_blocks:
+        if left_p > 0:
+            grid_overlays.append(f'<div class="bg-month-line" style="left:{left_p}%"></div>')
+
+    today_line_html = ""
+    today_hdr_badge = ""
+    if origin <= today <= last:
+        t_pct = get_pos(today)
+        today_line_html = f'<div class="bg-today-line" style="left:{t_pct}%"></div>'
+        today_hdr_badge = f'<div class="today-flag" style="left:{t_pct}%">TODAY</div>'
+
+    grid_bg_html = "".join(grid_overlays) + today_line_html
+
+    # Helper SVG icons for MS Project Task Mode / Indicator column
+    svg_mode_summary = (
+        '<svg width="11" height="11" viewBox="0 0 12 12" style="display:block;margin:auto;">'
+        '<path d="M1 3h10v3H9l-1.5 2v-2h-3v2L3 6H1V3z" fill="#0f172a"/>'
+        '</svg>'
+    )
+    svg_mode_task = (
+        '<svg width="11" height="11" viewBox="0 0 12 12" style="display:block;margin:auto;">'
+        '<rect x="1" y="3.5" width="10" height="5" rx="1" fill="#2b6cb0" stroke="#1e4e8c" stroke-width="0.8"/>'
+        '<path d="M3 2l-1.5 1.5L3 5M9 2l1.5 1.5L9 5" stroke="#475569" stroke-width="0.9" fill="none"/>'
+        '</svg>'
+    )
+    svg_mode_done = (
+        '<svg width="11" height="11" viewBox="0 0 12 12" style="display:block;margin:auto;">'
+        '<circle cx="6" cy="6" r="4.8" fill="#16a34a"/>'
+        '<path d="M3.6 6.2l1.6 1.6 3.2-3.4" stroke="#ffffff" stroke-width="1.4" fill="none" stroke-linecap="round"/>'
+        '</svg>'
+    )
+    svg_mode_milestone = (
+        '<svg width="10" height="10" viewBox="0 0 12 12" style="display:block;margin:auto;">'
+        '<polygon points="6,1 11,6 6,11 1,6" fill="#0f172a"/>'
+        '</svg>'
+    )
+
+    fmt_date = lambda dt: pd.Timestamp(dt).strftime("%a %d-%b-%y")
+    fmt_short = lambda dt: pd.Timestamp(dt).strftime("%d-%b")
+
+    # Build Rows (Project Summary + Stage Summaries + Subtasks)
+    rows_html = []
+    row_id = 0
+
+    all_s_min = wdf["Start Date"].min()
+    all_e_max = wdf["End Date"].max()
+    all_wd_total = max(
+        1,
+        int(np.busday_count(all_s_min.date(), all_e_max.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+    )
+
+    if include_project_summary:
+        row_id += 1
+        p_left = get_pos(wdf["Start"].min())
+        p_width = get_width(wdf["Start"].min(), wdf["End"].max())
+        p_lbl_pos = (
+            f"left:calc({round(p_left + p_width, 2)}% + 6px);"
+            if (p_left + p_width) < 84
+            else f"right:calc({round(100 - p_left, 2)}% + 6px);"
+        )
+        rows_html.append(f"""
+        <div class="g-row g-row-proj-sum">
+            <div class="c-col c-id">{row_id}</div>
+            <div class="c-col c-mode">{svg_mode_summary}</div>
+            <div class="c-col c-code">0</div>
+            <div class="c-col c-name"><span class="tw-arrow">&#9662;</span> <strong>PROJECT MASTER SCHEDULE SUMMARY</strong></div>
+            <div class="c-col c-days">{all_wd_total} days</div>
+            <div class="c-col c-date">{fmt_date(all_s_min)}</div>
+            <div class="c-col c-date">{fmt_date(all_e_max)}</div>
+            <div class="c-col c-disc">All Depts</div>
+            <div class="c-col c-resp">ACKD</div>
             <div class="c-timeline-cell">
-                <div class="g-bar" style="left:{left_pct}%; width:{w_pct}%; background:{col};">
-                    <span class="g-bar-label">{esc(resp_str)}</span>
+                <div class="ms-sum-bar ms-proj-bar" style="left:{p_left}%; width:{p_width}%;">
+                    <span class="ms-sum-cap-l"></span>
+                    <span class="ms-sum-cap-r"></span>
                 </div>
+                <span class="ms-sum-label" style="{p_lbl_pos}">Master Schedule ({all_wd_total}d)</span>
             </div>
         </div>
-        """
+        """)
 
-    m_hdr_html = "".join([f'<div class="hdr-cell" style="width:{pct}%;">{lbl}</div>' for lbl, pct in month_blocks])
-    w_hdr_html = "".join([f'<div class="hdr-cell" style="width:{pct}%; font-size:{sub_font_sz}px;">{lbl}</div>' for lbl, pct in week_blocks])
+    for s_idx, stage in enumerate(stage_order, start=1):
+        g = wdf[wdf["Stage"] == stage].sort_values(["Start", "End"])
+        base_col, border_col, hi_col = stage_colors[stage]
+        s_all = g["Start Date"].min()
+        e_all = g["End Date"].max()
+        ps_all = g["Start"].min()
+        pe_all = g["End"].max()
+        wd_all = int(np.busday_count(s_all.date(), e_all.date() + datetime.timedelta(days=1), weekmask=NP_WEEKMASK))
+        if s_all.date() == e_all.date() and wd_all == 0:
+            wd_all = 1
+
+        first_code = str(g.iloc[0].get("Code", "")).strip()
+        if "." in first_code:
+            stage_wbs = first_code.split(".")[0] + ".0"
+        else:
+            stage_wbs = f"{s_idx}.0"
+
+        s_left = get_pos(ps_all)
+        s_width = get_width(ps_all, pe_all)
+        row_id += 1
+
+        sum_lbl_pos = (
+            f"left:calc({round(s_left + s_width, 2)}% + 6px);"
+            if (s_left + s_width) < 84
+            else f"right:calc({round(100 - s_left, 2)}% + 6px);"
+        )
+        rows_html.append(f"""
+        <div class="g-row g-row-stage">
+            <div class="c-col c-id">{row_id}</div>
+            <div class="c-col c-mode">{svg_mode_summary}</div>
+            <div class="c-col c-code">{esc(stage_wbs)}</div>
+            <div class="c-col c-name" title="{esc(stage)}">
+                <span class="tw-arrow">&#9662;</span>
+                <span class="stage-dot" style="background:{base_col};border-color:{border_col}"></span>
+                <strong>{esc(stage)}</strong>
+            </div>
+            <div class="c-col c-days">{wd_all} days</div>
+            <div class="c-col c-date">{fmt_date(s_all)}</div>
+            <div class="c-col c-date">{fmt_date(e_all)}</div>
+            <div class="c-col c-disc"></div>
+            <div class="c-col c-resp"></div>
+            <div class="c-timeline-cell">
+                <div class="ms-sum-bar" style="left:{s_left}%; width:{s_width}%;">
+                    <span class="ms-sum-cap-l"></span>
+                    <span class="ms-sum-cap-r"></span>
+                </div>
+                <span class="ms-sum-label" style="{sum_lbl_pos}">{esc(stage)} ({wd_all}d)</span>
+            </div>
+        </div>
+        """)
+
+        prev_right_pct = None
+        g_list = list(g.iterrows())
+        for idx_in_stage, (_, r) in enumerate(g_list):
+            row_id += 1
+            left_pct = get_pos(r["Start"])
+            w_pct = get_width(r["Start"], r["End"])
+            s_dt = r["Start Date"]
+            e_dt = r["End Date"]
+            is_milestone = (s_dt.date() == e_dt.date()) and int(r["WorkDays"]) <= 1
+            is_completed = e_dt < today
+            code_str = str(r.get("Code", ""))
+            task_str = str(r.get("_CleanTask", "Task"))
+            disc_str = str(r.get("Disc", "-"))
+            days_val = int(r.get("WorkDays", 1))
+            days_str = f"{days_val} day" if days_val == 1 else f"{days_val} days"
+            resp_str = str(r.get("Resp", "")).strip()
+            if resp_str in ("-", "nan", "None"):
+                resp_str = ""
+
+            # Compute elapsed progress percentage relative to Today (MS Project inner progress bar)
+            if is_completed:
+                prog_pct = 100.0
+            elif s_dt <= today <= e_dt:
+                total_cal = max(1, (e_dt - s_dt).days + 1)
+                done_cal = max(0, (today - s_dt).days + 1)
+                prog_pct = min(100.0, round((done_cal / total_cal) * 100.0, 1))
+            else:
+                prog_pct = 0.0
+
+            prog_html = (
+                f'<div class="g-bar-prog" style="width:{prog_pct}%;"></div>'
+                if prog_pct > 0
+                else ""
+            )
+
+            # Subtle MS Project Finish-to-Start dependency link line from predecessor in same stage
+            dep_link_html = ""
+            if prev_right_pct is not None and left_pct >= prev_right_pct - 0.5:
+                conn_w = max(0.3, round(left_pct - prev_right_pct, 3))
+                dep_link_html = (
+                    f'<div class="ms-fs-link" style="left:{prev_right_pct}%;width:{conn_w}%;"></div>'
+                    f'<div class="ms-fs-arrow" style="left:{left_pct}%;">&#9656;</div>'
+                )
+            prev_right_pct = round(left_pct + w_pct, 3)
+
+            # Position label cleanly to right of bar (or left if bar is near right margin)
+            bar_right_edge = left_pct + w_pct
+            if resp_str:
+                bar_txt = f"{esc(resp_str)}"
+            else:
+                bar_txt = f"{fmt_short(s_dt)} - {fmt_short(e_dt)}"
+
+            if bar_right_edge <= 84.5:
+                lbl_style = f"left:calc({round(bar_right_edge, 3)}% + 5px);"
+            else:
+                lbl_style = f"right:calc({round(100.0 - left_pct, 3)}% + 5px); text-align:right;"
+
+            is_last_sub = (idx_in_stage == len(g_list) - 1)
+            branch_char = "└─" if is_last_sub else "├─"
+
+            if is_milestone:
+                bar_visual = f"""
+                {dep_link_html}
+                <div class="ms-milestone" style="left:{left_pct}%;" title="{esc(task_str)}">◆</div>
+                <span class="g-bar-label" style="{lbl_style}"><strong>{fmt_short(s_dt)}</strong> {bar_txt}</span>
+                """
+                mode_icon = svg_mode_milestone
+            else:
+                bar_visual = f"""
+                {dep_link_html}
+                <div class="g-bar" style="left:{left_pct}%; width:{w_pct}%; background:linear-gradient(180deg, {hi_col} 0%, {base_col} 40%, {border_col} 100%); border:1px solid {border_col};">
+                    <div class="g-bar-shine"></div>
+                    {prog_html}
+                </div>
+                <span class="g-bar-label" style="{lbl_style}">{bar_txt}</span>
+                """
+                mode_icon = svg_mode_done if is_completed else svg_mode_task
+
+            rows_html.append(f"""
+            <div class="g-row g-row-task">
+                <div class="c-col c-id">{row_id}</div>
+                <div class="c-col c-mode">{mode_icon}</div>
+                <div class="c-col c-code">{esc(code_str)}</div>
+                <div class="c-col c-name c-name-sub" title="{esc(task_str)}">
+                    <span class="tree-branch">{branch_char}</span>{esc(task_str)}
+                </div>
+                <div class="c-col c-days">{days_str}</div>
+                <div class="c-col c-date">{fmt_date(s_dt)}</div>
+                <div class="c-col c-date">{fmt_date(e_dt)}</div>
+                <div class="c-col c-disc" title="{esc(disc_str)}">{esc(disc_str)}</div>
+                <div class="c-col c-resp" title="{esc(resp_str)}">{esc(resp_str)}</div>
+                <div class="c-timeline-cell">
+                    {bar_visual}
+                </div>
+            </div>
+            """)
+
+    m_hdr_html = "".join([f'<div class="hdr-cell hdr-month" style="width:{pct}%;">{lbl}</div>' for lbl, pct, _ in month_blocks])
+    w_hdr_html = "".join([f'<div class="hdr-cell hdr-week" style="width:{pct}%;">{lbl}</div>' for lbl, pct, _ in week_blocks])
+
+    # Stage legend pills for the footer
+    stage_legend_items = "".join([
+        f'<span class="leg-item"><span class="leg-swatch" style="background:{stage_colors[s][0]};border:1px solid {stage_colors[s][1]}"></span>{esc(s)}</span>'
+        for s in stage_order[:8]
+    ])
+
+    hdr_total_h = 42
+    tier_h = 14
 
     html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>WBS Gantt Chart - A3 Landscape</title>
-<style>
+&lt;html&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;title&gt;MS Project WBS Gantt Schedule - A3 Landscape&lt;/title&gt;
+&lt;style&gt;
     @page {{
         size: 420mm 297mm;
-        margin: 6mm 8mm;
+        margin: 5mm 7mm;
     }}
     *, *:before, *:after {{
         box-sizing: border-box;
@@ -785,14 +1119,14 @@ def build_a3_single_page_html(df):
         print-color-adjust: exact !important;
     }}
     html, body {{
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        color: #1e293b;
-        background: #fff;
+        font-family: &quot;Segoe UI&quot;, -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
+        color: #0f172a;
+        background: #ffffff;
         margin: 0;
         padding: 0;
         width: 100%;
-        height: 285mm;
-        max-height: 285mm;
+        height: 286mm;
+        max-height: 286mm;
         overflow: hidden;
         page-break-after: avoid;
         page-break-inside: avoid;
@@ -802,97 +1136,296 @@ def build_a3_single_page_html(df):
         display: flex;
         justify-content: space-between;
         align-items: center;
-        background: #f1f5f9;
-        border: 1px solid #cbd5e1;
+        background: #0f2b48;
+        color: #ffffff;
         padding: 8px 16px;
-        border-radius: 6px;
-        margin-bottom: 8px;
+        border-radius: 4px;
+        margin-bottom: 6px;
     }}
-    .header-box {{
+    /* MS Project Top Title Banner */
+    .msp-title-banner {{
         display: flex;
         justify-content: space-between;
-        align-items: flex-end;
-        border-bottom: 2px solid #1e3a8a;
-        padding-bottom: 4px;
-        margin-bottom: 5px;
-        height: 32px;
+        align-items: center;
+        background: linear-gradient(90deg, #0f2b48 0%, #1e3a5f 60%, #1e40af 100%);
+        color: #ffffff;
+        padding: 5px 12px;
+        border: 1px solid #0f172a;
+        border-bottom: 2px solid #fbbf24;
+        height: 38px;
+        margin-bottom: 3px;
     }}
-    .main-title {{
-        font-size: 16px;
+    .msp-title-left {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }}
+    .msp-logo-badge {{
+        background: #fbbf24;
+        color: #0f172a;
+        font-weight: 800;
+        font-size: 10.5px;
+        padding: 3px 7px;
+        border-radius: 2px;
+        letter-spacing: 0.5px;
+    }}
+    .msp-main-title {{
+        font-size: 13.5px;
         font-weight: 700;
-        color: #1e3a8a;
-        line-height: 1.1;
+        letter-spacing: 0.3px;
+        line-height: 1.15;
     }}
-    .sub-title {{
-        font-size: 9px;
-        color: #64748b;
+    .msp-sub-title {{
+        font-size: 8.5px;
+        color: #cbd5e1;
     }}
-    .stats-box {{
-        font-size: 9px;
-        color: #334155;
-        text-align: right;
+    .msp-kpi-strip {{
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        font-size: 8.5px;
     }}
+    .msp-kpi-item {{
+        background: rgba(255,255,255,0.1);
+        border: 1px solid rgba(255,255,255,0.22);
+        padding: 2px 8px;
+        border-radius: 3px;
+    }}
+    .msp-kpi-item strong {{
+        color: #fde68a;
+        font-size: 9.5px;
+    }}
+
+    /* Main MS Project Split Grid Container */
     .g-container {{
         width: 100%;
-        border: 1px solid #cbd5e1;
-        border-radius: 3px;
-        background: #fff;
+        border: 1.5px solid #475569;
+        background: #ffffff;
+        position: relative;
         page-break-inside: avoid;
     }}
+
+    /* Table + Timeline Header */
     .g-header {{
         display: flex;
-        background: #f8fafc;
-        border-bottom: 1.5px solid #94a3b8;
-        font-weight: 600;
-        color: #334155;
-        height: 32px;
+        background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+        border-bottom: 1.5px solid #475569;
+        font-weight: 700;
+        color: #1e293b;
+        height: {hdr_total_h}px;
+        font-size: {sub_font_sz}px;
     }}
     .c-col {{
         padding: 0 4px;
-        border-right: 1px solid #e2e8f0;
+        border-right: 1px solid #cbd5e1;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         flex: none;
         display: flex;
         align-items: center;
+        height: 100%;
     }}
-    .c-code {{ width: 44px; justify-content: center; color: #64748b; }}
-    .c-name {{ width: 230px; font-weight: 600; color: #0f172a; }}
-    .c-date {{ width: 70px; justify-content: center; }}
-    .c-days {{ width: 36px; justify-content: center; }}
-    .c-disc {{ width: 80px; }}
+    .g-header .c-col {{
+        border-right: 1px solid #94a3b8;
+        justify-content: center;
+        text-transform: uppercase;
+        letter-spacing: 0.2px;
+    }}
+    .g-header .c-name {{
+        justify-content: flex-start;
+        padding-left: 6px;
+    }}
+    /* MS Project Sheet Column Widths (Total = 655px) */
+    .c-id   {{ width: 24px; justify-content: center; background: #f1f5f9; color: #475569; font-weight: 600; font-size: {sub_font_sz}px; }}
+    .c-mode {{ width: 20px; justify-content: center; padding: 0; background: #f8fafc; }}
+    .c-code {{ width: 42px; justify-content: flex-start; color: #334155; font-family: "Consolas", "Courier New", monospace; font-size: {sub_font_sz}px; }}
+    .c-name {{ width: 225px; color: #0f172a; }}
+    .c-days {{ width: 48px; justify-content: flex-end; font-variant-numeric: tabular-nums; color: #1e293b; }}
+    .c-date {{ width: 74px; justify-content: center; font-variant-numeric: tabular-nums; color: #334155; font-size: {sub_font_sz}px; }}
+    .c-disc {{ width: 72px; color: #334155; }}
+    .c-resp {{ width: 76px; color: #334155; border-right: 2px solid #475569 !important; }}
+
+    /* Right Timeline Header */
     .c-timeline-hdr {{
         flex: 1;
         display: flex;
         flex-direction: column;
+        position: relative;
+        overflow: hidden;
     }}
     .hdr-row {{
         display: flex;
         width: 100%;
-        border-bottom: 1px solid #e2e8f0;
-        height: 16px;
+        border-bottom: 1px solid #94a3b8;
+        height: {tier_h}px;
         align-items: center;
     }}
     .hdr-row:last-child {{ border-bottom: none; }}
     .hdr-cell {{
         text-align: center;
-        border-right: 1px solid #e2e8f0;
+        border-right: 1px solid #94a3b8;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         height: 100%;
-        line-height: 16px;
+        line-height: {tier_h}px;
         font-size: {sub_font_sz}px;
     }}
+    .hdr-month {{
+        background: #dde5ef;
+        font-weight: 700;
+        color: #0f2b48;
+    }}
+    .hdr-week {{
+        background: #eef2f7;
+        font-weight: 600;
+        color: #334155;
+        border-right: 1px solid #cbd5e1;
+    }}
+    .hdr-subweek {{
+        background: #f8fafc;
+        font-size: {max(5.2, sub_font_sz - 1.0)}px;
+        color: #64748b;
+        border-right: 1px solid #e2e8f0;
+    }}
+    .hdr-tier-days {{
+        background: #f8fafc;
+    }}
+    .t-day-cell {{
+        flex: none;
+        height: 100%;
+        line-height: {tier_h}px;
+        text-align: center;
+        font-size: {max(5.2, sub_font_sz - 1.2)}px;
+        color: #64748b;
+        border-right: 1px solid #e2e8f0;
+    }}
+    .t-day-wknd {{
+        background: #cbd5e1;
+        color: #475569;
+        font-weight: 700;
+    }}
+    .today-flag {{
+        position: absolute;
+        top: 0;
+        transform: translateX(-50%);
+        background: #dc2626;
+        color: #fff;
+        font-size: 6.5px;
+        font-weight: 800;
+        padding: 0 3px;
+        line-height: 10px;
+        border-radius: 0 0 2px 2px;
+        z-index: 10;
+    }}
+
+    /* Body Wrapper with Full-Height Gridlines */
+    .g-body-wrap {{
+        position: relative;
+        width: 100%;
+    }}
+    .g-timeline-bg-layer {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 655px; /* exact sum of left columns: 24+20+42+225+48+74+74+72+76 = 655px */
+        right: 0;
+        pointer-events: none;
+        z-index: 1;
+        overflow: hidden;
+    }}
+    .bg-wknd {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        background: rgba(148, 163, 184, 0.16);
+        border-left: 1px solid rgba(148, 163, 184, 0.22);
+        border-right: 1px solid rgba(148, 163, 184, 0.22);
+    }}
+    .bg-week-line {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 0;
+        border-left: 1px dashed #d5dde7;
+    }}
+    .bg-month-line {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 0;
+        border-left: 1px solid #94a3b8;
+    }}
+    .bg-today-line {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 0;
+        border-left: 1.8px dashed #dc2626;
+        z-index: 8;
+    }}
+
+    /* Rows */
     .g-row {{
         display: flex;
-        border-bottom: 1px solid #f1f5f9;
+        border-bottom: 1px solid #e2e8f0;
         height: {row_h}px;
         align-items: center;
+        position: relative;
+        z-index: 2;
         page-break-inside: avoid;
     }}
-    .g-row:nth-child(even) {{ background: #fafafa; }}
+    .g-row-task:nth-child(even) {{
+        background: rgba(248, 250, 252, 0.65);
+    }}
+    .g-row-proj-sum {{
+        background: #cbd5e1 !important;
+        border-top: 1.5px solid #334155;
+        border-bottom: 1.5px solid #334155;
+        font-weight: 700;
+        color: #0f172a;
+    }}
+    .g-row-proj-sum .c-col {{
+        font-weight: 700;
+    }}
+    .g-row-stage {{
+        background: #e2e8f0 !important;
+        border-top: 1px solid #94a3b8;
+        border-bottom: 1px solid #94a3b8;
+        font-weight: 700;
+        color: #0f172a;
+    }}
+    .g-row-stage .c-col {{
+        font-weight: 700;
+        color: #0f172a;
+    }}
+    .tw-arrow {{
+        display: inline-block;
+        font-size: 9px;
+        margin-right: 3px;
+        color: #1e293b;
+    }}
+    .stage-dot {{
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        border-radius: 1px;
+        border: 1px solid #1e293b;
+        margin-right: 4px;
+        flex: none;
+    }}
+    .c-name-sub {{
+        padding-left: 12px;
+    }}
+    .tree-branch {{
+        color: #94a3b8;
+        font-family: monospace;
+        margin-right: 3px;
+        font-size: {sub_font_sz}px;
+    }}
+
+    /* Timeline Cell & MS Project Bars */
     .c-timeline-cell {{
         flex: 1;
         height: 100%;
@@ -900,61 +1433,246 @@ def build_a3_single_page_html(df):
     }}
     .g-bar {{
         position: absolute;
-        top: {max(2, (row_h - bar_h)//2)}px;
+        top: {max(1, (row_h - bar_h) // 2)}px;
         height: {bar_h}px;
-        border-radius: 2px;
-        white-space: nowrap;
+        border-radius: 1.5px;
+        z-index: 4;
+        box-shadow: 0 1px 1px rgba(15, 23, 42, 0.18);
+        overflow: hidden;
+    }}
+    .g-bar-shine {{
+        width: 100%;
+        height: 35%;
+        background: rgba(255, 255, 255, 0.28);
+    }}
+    .g-bar-prog {{
+        position: absolute;
+        left: 0;
+        top: 35%;
+        height: 32%;
+        background: rgba(15, 23, 42, 0.45);
+        border-right: 1px solid rgba(255, 255, 255, 0.7);
     }}
     .g-bar-label {{
         position: absolute;
-        left: calc(100% + 4px);
         top: 0;
-        line-height: {bar_h}px;
+        line-height: {row_h}px;
         font-size: {sub_font_sz}px;
+        color: #1e293b;
+        font-weight: 600;
+        white-space: nowrap;
+        z-index: 5;
+    }}
+
+    /* Finish-to-Start Dependency Connectors */
+    .ms-fs-link {{
+        position: absolute;
+        top: 0;
+        height: 55%;
+        border-left: 1px solid #64748b;
+        border-bottom: 1px solid #64748b;
+        z-index: 3;
+        pointer-events: none;
+    }}
+    .ms-fs-arrow {{
+        position: absolute;
+        top: 50%;
+        transform: translate(-85%, -52%);
+        font-size: 7px;
         color: #475569;
-        font-weight: 500;
+        z-index: 5;
+        pointer-events: none;
+    }}
+
+    /* MS Project Summary Bar with Downward Fangs/Brackets */
+    .ms-sum-bar {{
+        position: absolute;
+        top: {max(2, (row_h - sum_bar_h) // 2 - 1)}px;
+        height: {sum_bar_h}px;
+        background: #1e293b;
+        z-index: 5;
+    }}
+    .ms-proj-bar {{
+        background: #0f172a;
+        height: {sum_bar_h + 1}px;
+    }}
+    .ms-sum-cap-l, .ms-sum-cap-r {{
+        position: absolute;
+        top: {sum_bar_h - 1}px;
+        width: 0;
+        height: 0;
+        border-top: {max(4, sum_bar_h)}px solid #1e293b;
+        border-left: 3.5px solid transparent;
+        border-right: 3.5px solid transparent;
+    }}
+    .ms-sum-cap-l {{ left: -0.5px; }}
+    .ms-sum-cap-r {{ right: -0.5px; }}
+    .ms-sum-label {{
+        position: absolute;
+        top: 0;
+        line-height: {row_h}px;
+        font-size: {sub_font_sz}px;
+        font-weight: 700;
+        color: #0f172a;
+        white-space: nowrap;
+        z-index: 5;
+    }}
+
+    /* Milestone Diamond */
+    .ms-milestone {{
+        position: absolute;
+        top: 0;
+        transform: translateX(-50%);
+        line-height: {row_h}px;
+        font-size: {max(8.0, font_sz + 1.5)}px;
+        color: #0f172a;
+        z-index: 6;
+    }}
+
+    /* MS Project Footer Title Block & Legend */
+    .msp-footer {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border: 1px solid #475569;
+        border-top: none;
+        background: #f8fafc;
+        padding: 3px 10px;
+        height: 28px;
+        font-size: 8px;
+        color: #334155;
+    }}
+    .leg-group {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: nowrap;
+        overflow: hidden;
+    }}
+    .leg-item {{
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+        font-weight: 600;
+    }}
+    .leg-swatch {{
+        display: inline-block;
+        width: 12px;
+        height: 7px;
+        border-radius: 1px;
+    }}
+    .leg-sum-demo {{
+        display: inline-block;
+        width: 14px;
+        height: 4px;
+        background: #1e293b;
+        position: relative;
+        margin-bottom: 2px;
+    }}
+    .leg-sum-demo:before, .leg-sum-demo:after {{
+        content: "";
+        position: absolute;
+        top: 3px;
+        border-top: 4px solid #1e293b;
+        border-left: 2.5px solid transparent;
+        border-right: 2.5px solid transparent;
+    }}
+    .leg-sum-demo:before {{ left: 0; }}
+    .leg-sum-demo:after {{ right: 0; }}
+    .leg-today-demo {{
+        display: inline-block;
+        width: 10px;
+        height: 0;
+        border-top: 2px dashed #dc2626;
+    }}
+    .leg-wknd-demo {{
+        display: inline-block;
+        width: 10px;
+        height: 8px;
+        background: #cbd5e1;
+        border: 1px solid #94a3b8;
     }}
     @media print {{
         .no-print {{ display: none !important; }}
     }}
-</style>
-</head>
-<body>
-    <div class="no-print">
-        <div style="font-weight:600; font-size:13px; color:#1e3a8a;">
-            🗓️ WBS Gantt Chart - A3 Landscape Vector Print Preview (1-Page Fit)
-        </div>
-        <button onclick="window.print()" style="background:#2563eb; color:#fff; border:none; padding:7px 18px; border-radius:4px; font-weight:600; cursor:pointer; font-size:12px;">
-            🖨️ Print to A3 PDF
-        </button>
-    </div>
-    <div class="header-box">
-        <div>
-            <div class="main-title">Project Schedule & Work Breakdown Structure (WBS)</div>
-            <div class="sub-title">Engineering Resource Planner | Single Page A3 Landscape Vector PDF | Generated: {today.strftime('%d-%b-%Y')}</div>
-        </div>
-        <div class="stats-box">
-            Tasks: <strong>{n_rows}</strong> &nbsp;|&nbsp; Timeline: <strong>{origin.strftime('%d-%b-%Y')}</strong> to <strong>{last.strftime('%d-%b-%Y')}</strong>
-        </div>
-    </div>
-    <div class="g-container">
-        <div class="g-header">
-            <div class="c-col c-code">WBS</div>
-            <div class="c-col c-name">Task Name</div>
-            <div class="c-col c-date">Start Date</div>
-            <div class="c-col c-date">End Date</div>
-            <div class="c-col c-days">Days</div>
-            <div class="c-col c-disc">Department</div>
-            <div class="c-timeline-hdr">
-                <div class="hdr-row">{m_hdr_html}</div>
-                <div class="hdr-row">{w_hdr_html}</div>
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+    &lt;div class=&quot;no-print&quot;&gt;
+        &lt;div style=&quot;font-weight:700; font-size:13px;&quot;&gt;
+            📊 Microsoft Project View — A3 Landscape Master Schedule (1-Page Vector Fit)
+        &lt;/div&gt;
+        &lt;button onclick=&quot;window.print()&quot; style=&quot;background:#fbbf24; color:#0f172a; border:none; padding:6px 18px; border-radius:3px; font-weight:700; cursor:pointer; font-size:12px;&quot;&gt;
+            🖨️ Print / Save as A3 PDF
+        &lt;/button&gt;
+    &lt;/div&gt;
+
+    <!-- MS Project Header Title Block -->
+    <div class="msp-title-banner">
+        <div class="msp-title-left">
+            <div class="msp-logo-badge">MS PROJECT VIEW</div>
+            <div>
+                <div class="msp-main-title">{esc(schedule_title)}</div>
+                <div class="msp-sub-title">Dynamic Engineering Resource Planner — ACKD &nbsp;|&nbsp; Work Calendar: Sunday–Thursday (8 Hrs/Day) &nbsp;|&nbsp; A3 Landscape Vector Print</div>
             </div>
         </div>
-        {table_rows_html}
+        <div class="msp-kpi-strip">
+            <div class="msp-kpi-item">Stages: <strong>{len(stage_order)}</strong></div>
+            <div class="msp-kpi-item">Activities: <strong>{len(wdf)}</strong></div>
+            <div class="msp-kpi-item">Start: <strong>{all_s_min.strftime('%d-%b-%Y')}</strong></div>
+            <div class="msp-kpi-item">Finish: <strong>{all_e_max.strftime('%d-%b-%Y')}</strong></div>
+            <div class="msp-kpi-item">Net Duration: <strong>{all_wd_total} Work Days</strong></div>
+            <div class="msp-kpi-item">Status Date: <strong>{today.strftime('%d-%b-%Y')}</strong></div>
+        </div>
     </div>
-</body>
-</html>
-"""
+
+    <!-- Main Split Sheet + Gantt Chart Container -->
+    <div class="g-container">
+        <div class="g-header">
+            <div class="c-col c-id">ID</div>
+            <div class="c-col c-mode">&#9432;</div>
+            <div class="c-col c-code">WBS</div>
+            <div class="c-col c-name">Task Name</div>
+            <div class="c-col c-days">Duration</div>
+            <div class="c-col c-date">Start</div>
+            <div class="c-col c-date">Finish</div>
+            <div class="c-col c-disc">Department</div>
+            <div class="c-col c-resp">Resource</div>
+            <div class="c-timeline-hdr">
+                {today_hdr_badge}
+                <div class="hdr-row">{m_hdr_html}</div>
+                <div class="hdr-row">{w_hdr_html}</div>
+                {day_tier_html}
+            </div>
+        </div>
+        <div class="g-body-wrap">
+            <div class="g-timeline-bg-layer">
+                {grid_bg_html}
+            </div>
+            {"".join(rows_html)}
+        </div>
+    </div>
+
+    <!-- MS Project Legend & Engineering Footer Block -->
+    <div class="msp-footer">
+        <div class="leg-group">
+            <span style="font-weight:800; color:#0f2b48;">LEGEND:</span>
+            <span class="leg-item"><span class="leg-sum-demo"></span> Summary Rollup</span>
+            <span class="leg-item"><span class="leg-swatch" style="background:linear-gradient(180deg,#63b3ed,#2b6cb0);border:1px solid #1e4e8c"></span> Activity Bar</span>
+            <span class="leg-item"><span>◆</span> Milestone</span>
+            <span class="leg-item"><span class="leg-today-demo"></span> Today Line</span>
+            <span class="leg-item"><span class="leg-wknd-demo"></span> Weekend (Fri–Sat)</span>
+            <span style="color:#94a3b8;">|</span>
+            {stage_legend_items}
+        </div>
+        <div style="white-space:nowrap; font-weight:700; color:#0f2b48;">
+            ACKD Engineering Planner &nbsp;|&nbsp; Scale: 1-Page A3 (420×297mm) &nbsp;|&nbsp; Page 1 of 1
+        </div>
+    </div>
+&lt;/body&gt;
+&lt;/html&gt;
+&quot;&quot;&quot;
     return html
 
 
@@ -1046,26 +1764,26 @@ def render_wbs_gantt():
 
     df = df.sort_values(["Start", "End"]).reset_index(drop=True)
 
-    # ---- Action Toolbar: Guaranteed A3 PDF Print / Download Button ----
+    # ---- Action Toolbar: Guaranteed MS Project A3 PDF Print / Download Button ----
     col_a, col_b, col_c = st.columns([1.5, 2.8, 2.0])
     with col_a:
         if st.button("🔄 Refresh Live Sheet", use_container_width=True):
             load_wbs.clear()
             st.rerun()
 
-    # Pre-generate exact-fit A3 Single-Page Vector HTML & PDF
+    # Pre-generate exact-fit MS Project A3 Single-Page Vector HTML & PDF
     a3_html = build_a3_single_page_html(df)
     pdf_bytes = export_a3_pdf(a3_html) if HAS_WEASYPRINT else None
 
     with col_b:
         if pdf_bytes:
             st.download_button(
-                "📥 Download A3 PDF (1-Page Fit)",
+                "📥 Download MS Project A3 PDF (1-Page Fit)",
                 data=pdf_bytes,
-                file_name=f"WBS_Gantt_A3_{datetime.date.today().strftime('%Y%m%d')}.pdf",
+                file_name=f"MS_Project_WBS_Gantt_A3_{datetime.date.today().strftime('%Y%m%d')}.pdf",
                 mime="application/pdf",
                 use_container_width=True,
-                help="Download exact-fit A3 Landscape Vector PDF fitted strictly onto 1 single page"
+                help="Download exact-fit MS Project style A3 Landscape Vector PDF fitted strictly onto 1 single page"
             )
         else:
             # Client-side 1-click A3 print dialog (works 100% reliably on all platforms)
@@ -1074,21 +1792,22 @@ def render_wbs_gantt():
                 <button onclick="printA3Doc()" style="
                     width: 100%;
                     height: 38px;
-                    background-color: #2563eb;
+                    background: linear-gradient(90deg, #0f2b48 0%, #1e40af 100%);
                     color: white;
-                    border: none;
+                    border: 1px solid #0f172a;
+                    border-bottom: 2px solid #fbbf24;
                     border-radius: 4px;
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    font-size: 13.5px;
-                    font-weight: 600;
+                    font-size: 13px;
+                    font-weight: 700;
                     cursor: pointer;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     gap: 6px;
-                    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.18);
                 ">
-                    🖨️ Print / Save as A3 PDF (1-Page Fit)
+                    🖨️ Print / Save MS Project A3 PDF (1-Page Fit)
                 </button>
                 <script>
                 function printA3Doc() {{
@@ -1210,7 +1929,7 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
     return calc_df, count_col
 
 
-def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed=True):
+def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed=True, team_label=None, show_a3_export=False):
     name_col = find_name_col(calc_df)
     gantt_df = calc_df.copy()
     gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
@@ -1262,6 +1981,67 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         for s, e in zip(gantt_df["Start"], gantt_df["End"])
     ]
     project_order = gantt_df["Project"].tolist()
+
+    # Optional MS Project A3 PDF Export button for Team Project Timelines
+    if show_a3_export:
+        export_df = pd.DataFrame({
+            "Code": [str(r.get("No.", i + 1)) if pd.notnull(r.get("No.")) and str(r.get("No.")).strip() != "" else str(i + 1) for i, (_, r) in enumerate(gantt_df.iterrows())],
+            "Task": [str(r.get(name_col, r["Project"])) if name_col else str(r["Project"]) for _, r in gantt_df.iterrows()],
+            "Stage": [team_label or "Active Projects"] * len(gantt_df),
+            "Start Date": gantt_df["Start"].values,
+            "End Date": gantt_df["End"].values,
+            "Start": gantt_df["Start"].values,
+            "End": gantt_df["End"].values,
+            "WorkDays": gantt_df["WorkDays"].values,
+            "Disc": [team_label or ", ".join(disciplines)] * len(gantt_df),
+            "Resp": [f"{r['TotalHrs']:,.0f} Hrs" if r["TotalHrs"] > 0 else "" for _, r in gantt_df.iterrows()],
+        })
+        title_str = f"{team_label.upper()} — PROJECT SCHEDULE & GANTT TIMELINE" if team_label else "PROJECT SCHEDULE & GANTT TIMELINE"
+        team_a3_html = build_a3_single_page_html(export_df, schedule_title=title_str)
+        team_pdf_bytes = export_a3_pdf(team_a3_html) if HAS_WEASYPRINT else None
+        if team_pdf_bytes:
+            st.download_button(
+                "📥 Download MS Project A3 PDF (1-Page Fit)",
+                data=team_pdf_bytes,
+                file_name=f"MS_Project_{_get_safe_team_name(team_label or 'Team')}_Gantt_A3_{datetime.date.today().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                key=f"dl_a3_{team_label}",
+            )
+        else:
+            escaped_team_html = json.dumps(team_a3_html)
+            components.html(f"""
+                <button onclick="printTeamA3Doc()" style="
+                    padding: 6px 16px;
+                    height: 34px;
+                    background: linear-gradient(90deg, #0f2b48 0%, #1e40af 100%);
+                    color: white;
+                    border: 1px solid #0f172a;
+                    border-bottom: 2px solid #fbbf24;
+                    border-radius: 4px;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-size: 12.5px;
+                    font-weight: 700;
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                ">
+                    🖨️ Print / Save MS Project A3 PDF (1-Page Fit)
+                </button>
+                <script>
+                function printTeamA3Doc() {{
+                    var docContent = {escaped_team_html};
+                    var win = window.open('', '_blank');
+                    win.document.open();
+                    win.document.write(docContent);
+                    win.document.close();
+                    win.focus();
+                    setTimeout(function() {{
+                        win.print();
+                    }}, 400);
+                }}
+                </script>
+            """, height=42)
 
     x_min = gantt_df["Start"].min() - pd.Timedelta(days=2)
     span_days = max(1, (gantt_df["EndPlus"].max() - gantt_df["Start"].min()).days)
@@ -1572,7 +2352,7 @@ with c_hist:
             st.warning("No previous backups found for this team yet.")
 
 with c_actions:
-    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    st.markdown("&lt;div style=&#39;height: 28px;&#39;&gt;&lt;/div&gt;", unsafe_allow_html=True)
     c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1.4])
     with c_btn1:
         refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
@@ -1710,7 +2490,10 @@ st.markdown("---")
 st.subheader("🗓️ Project Timeline (Gantt Chart)")
 
 hide_completed = st.checkbox("Filter completed", value=False, key=f"hide_comp_{selected_team}")
-render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed)
+render_project_gantt_chart(
+    calc_df, disciplines, team_mode, count_col, hide_completed,
+    team_label=selected_team, show_a3_export=True
+)
 
 # ----------------------------------------------------------------------
 # 5. Calculation Engine (daily, Sunday - Thursday)
