@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import datetime
+import io
 from urllib.parse import quote
 
 import streamlit as st
@@ -9,15 +10,16 @@ import pandas as pd
 import numpy as np
 import altair as alt
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
 
 # ----------------------------------------------------------------------
 # 1. Page Configuration & Setup
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
-
-BACKUP_DIR = "backups"
-os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
 TEAMS = {
@@ -85,48 +87,89 @@ HOURS_PER_DAY = 8
 
 
 # ----------------------------------------------------------------------
-# 1b. Backup Management System (Timestamped Snapshots & Differences)
+# 1b. Cloud Backup Management System (Google Drive API via Secrets)
 # ----------------------------------------------------------------------
 def _get_safe_team_name(team_name):
     return "".join(c for c in team_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
 
 
+def get_drive_service():
+    """Initializes and returns Google Drive API service using Service Account credentials."""
+    if "gcp_service_account" not in st.secrets:
+        raise ValueError("Missing 'gcp_service_account' in st.secrets.")
+    creds_info = dict(st.secrets["gcp_service_account"])
+    credentials = service_account.Credentials.from_service_account_info(
+        creds_info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=credentials)
+
+
 def save_backup(team_name, df, counts=None, timestamp_str=None):
-    """Saves a backup CSV (and optional JSON counts) with timestamp."""
+    """Uploads backup CSV (and optional JSON counts) directly to designated Google Drive folder."""
     if df is None or df.empty:
         return None
     if timestamp_str is None:
         timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    safe_team = _get_safe_team_name(team_name)
-    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}.csv")
-    df.to_csv(csv_path, index=False)
-    if counts is not None:
-        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}_counts.json")
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(counts, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-    return timestamp_str
+    
+    try:
+        service = get_drive_service()
+        folder_id = st.secrets["gdrive"]["folder_id"]
+        safe_team = _get_safe_team_name(team_name)
+
+        # 1. Upload CSV dataset
+        csv_filename = f"{safe_team}_{timestamp_str}.csv"
+        csv_buffer = io.BytesIO(df.to_csv(index=False).encode("utf-8"))
+        media_csv = MediaIoBaseUpload(csv_buffer, mimetype="text/csv", resumable=True)
+        csv_metadata = {
+            "name": csv_filename,
+            "parents": [folder_id]
+        }
+        service.files().create(body=csv_metadata, media_body=media_csv, fields="id").execute()
+
+        # 2. Upload JSON counts if provided
+        if counts is not None:
+            json_filename = f"{safe_team}_{timestamp_str}_counts.json"
+            json_buffer = io.BytesIO(json.dumps(counts, ensure_ascii=False, indent=2).encode("utf-8"))
+            media_json = MediaIoBaseUpload(json_buffer, mimetype="application/json", resumable=True)
+            json_metadata = {
+                "name": json_filename,
+                "parents": [folder_id]
+            }
+            service.files().create(body=json_metadata, media_body=media_json, fields="id").execute()
+
+        return timestamp_str
+    except Exception as e:
+        st.error(f"Error saving cloud backup to Google Drive: {e}")
+        return None
 
 
 save_daily_backup = save_backup
 
 
 def list_backups(team_name):
-    """Lists available backup identifiers in descending order (newest first)."""
-    safe_team = _get_safe_team_name(team_name)
-    prefix = f"{safe_team}_"
-    pattern = os.path.join(BACKUP_DIR, f"{prefix}*.csv")
-    files = glob.glob(pattern)
-    dates = []
-    for f in files:
-        base = os.path.basename(f)
-        if base.startswith(prefix) and base.endswith(".csv"):
-            date_part = base[len(prefix):-4]
-            if not date_part.endswith("_counts"):
-                dates.append(date_part)
-    return sorted(list(set(dates)), reverse=True)
+    """Retrieves available backup timestamps from Google Drive in descending order."""
+    try:
+        service = get_drive_service()
+        folder_id = st.secrets["gdrive"]["folder_id"]
+        safe_team = _get_safe_team_name(team_name)
+        prefix = f"{safe_team}_"
+
+        query = f"'{folder_id}' in parents and trashed = false and name contains '{prefix}' and mimeType = 'text/csv'"
+        results = service.files().list(q=query, fields="files(id, name)", pageSize=100).execute()
+        files = results.get("files", [])
+
+        dates = []
+        for f in files:
+            name = f["name"]
+            if name.startswith(prefix) and name.endswith(".csv"):
+                date_part = name[len(prefix):-4]
+                if not date_part.endswith("_counts"):
+                    dates.append(date_part)
+
+        return sorted(list(set(dates)), reverse=True)
+    except Exception as e:
+        st.warning(f"Unable to list backups from Google Drive: {e}")
+        return []
 
 
 def format_backup_label(b_str):
@@ -141,29 +184,61 @@ def format_backup_label(b_str):
 
 
 def load_backup(team_name, date_str):
-    """Loads dataframe and counts from a specified backup identifier."""
+    """Downloads and loads dataframe and counts from Google Drive into memory."""
     if not date_str:
         return None, {}
-    safe_team = _get_safe_team_name(team_name)
-    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
-    json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
-    if not os.path.exists(csv_path):
+    
+    try:
+        safe_team = _get_safe_team_name(team_name)
+        folder_id = st.secrets["gdrive"]["folder_id"]
+        service = get_drive_service()
+
+        csv_name = f"{safe_team}_{date_str}.csv"
+        json_name = f"{safe_team}_{date_str}_counts.json"
+
+        query = f"'{folder_id}' in parents and trashed = false and (name = '{csv_name}' or name = '{json_name}')"
+        results = service.files().list(q=query, fields="files(id, name)").execute()
+        files = {f["name"]: f["id"] for f in results.get("files", [])}
+
+        if csv_name not in files:
+            return None, {}
+
+        # Download CSV
+        request = service.files().get_media(fileId=files[csv_name])
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        df = pd.read_csv(fh)
+
+        df.columns = df.columns.astype(str).str.strip()
+        df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
+        df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
+        for c in df.columns:
+            if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Download JSON counts
+        counts = {}
+        if json_name in files:
+            try:
+                req_json = service.files().get_media(fileId=files[json_name])
+                fh_json = io.BytesIO()
+                dl_json = MediaIoBaseDownload(fh_json, req_json)
+                done_json = False
+                while not done_json:
+                    _, done_json = dl_json.next_chunk()
+                fh_json.seek(0)
+                counts = json.load(fh_json)
+            except Exception:
+                pass
+
+        return df, counts
+    except Exception as e:
+        st.error(f"Error loading backup from Google Drive: {e}")
         return None, {}
-    df = pd.read_csv(csv_path)
-    df.columns = df.columns.astype(str).str.strip()
-    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
-    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
-    for c in df.columns:
-        if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    counts = {}
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                counts = json.load(f)
-        except Exception:
-            pass
-    return df, counts
 
 
 def compare_datasets(current_df, backup_df, disciplines):
@@ -873,7 +948,7 @@ try:
     if (do_refresh_backup or not list_backups(selected_team)) and live_projects is not None and not live_projects.empty:
         new_ts = save_backup(selected_team, live_projects, live_eng_counts)
         if do_refresh_backup:
-            st.toast(f"✅ Auto-backup archived on refresh: {format_backup_label(new_ts)}")
+            st.toast(f"✅ Auto-backup archived to Drive: {format_backup_label(new_ts)}")
 
 except Exception as e:
     st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
@@ -902,7 +977,7 @@ with c_hist:
                 index=0
             )
         else:
-            st.warning("No previous backups found for this team yet.")
+            st.warning("No previous backups found in Google Drive for this team yet.")
 
 with c_actions:
     st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
@@ -910,7 +985,7 @@ with c_actions:
     with c_btn1:
         refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
     with c_btn2:
-        save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot.")
+        save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot to Google Drive.")
     with c_btn3:
         st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
 
@@ -924,7 +999,8 @@ if refresh_clicked:
 
 if save_backup_now and live_projects is not None:
     saved_ts = save_backup(selected_team, live_projects, live_eng_counts)
-    st.success(f"✅ Saved backup snapshot: {format_backup_label(saved_ts)}")
+    if saved_ts:
+        st.success(f"✅ Saved backup snapshot to Drive: {format_backup_label(saved_ts)}")
     st.rerun()
 
 # Determine active dataset based on user selection
@@ -932,7 +1008,7 @@ counts_source = "defaults"
 if data_source == "🕰️ Historical Backup" and selected_backup_date:
     df_projects, sheet_eng_counts = load_backup(selected_team, selected_backup_date)
     if df_projects is None or df_projects.empty:
-        st.warning("⚠️ Could not load backup data. Reverting to live data.")
+        st.warning("⚠️ Could not load backup data from Drive. Reverting to live data.")
         df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
         sheet_eng_counts = live_eng_counts
         counts_source = "Live Google Sheet"
@@ -943,7 +1019,7 @@ else:
     df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
     sheet_eng_counts = live_eng_counts
     counts_source = "Live Google Sheet"
-    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
+    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Cloud backups enabled).")
 
 # ----------------------------------------------------------------------
 # 2f. Differences & Change Comparison
@@ -951,7 +1027,7 @@ else:
 with st.expander("🔍 Compare Changes with a Previous Backup"):
     cmp_backups = list_backups(selected_team)
     if not cmp_backups:
-        st.info("No saved backup files available to compare.")
+        st.info("No saved backup files available in Google Drive to compare.")
     elif live_projects is None:
         st.warning("Live data not available to compare.")
     else:
