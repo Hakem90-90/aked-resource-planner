@@ -1,6 +1,3 @@
-import os
-import glob
-import json
 import datetime
 from urllib.parse import quote
 
@@ -15,9 +12,6 @@ import altair as alt
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
-
-BACKUP_DIR = "backups"
-os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
 TEAMS = {
@@ -82,165 +76,6 @@ DATA_COLS = list({
 NP_WEEKMASK = "1111001"
 PD_WEEKMASK = "Sun Mon Tue Wed Thu"
 HOURS_PER_DAY = 8
-
-
-# ----------------------------------------------------------------------
-# 1b. Backup Management System (Timestamped Snapshots & Differences)
-# ----------------------------------------------------------------------
-def _get_safe_team_name(team_name):
-    return "".join(c for c in team_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
-
-
-def save_backup(team_name, df, counts=None, timestamp_str=None):
-    """Saves a backup CSV (and optional JSON counts) with timestamp."""
-    if df is None or df.empty:
-        return None
-    if timestamp_str is None:
-        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    safe_team = _get_safe_team_name(team_name)
-    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}.csv")
-    df.to_csv(csv_path, index=False)
-    if counts is not None:
-        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}_counts.json")
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(counts, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-    return timestamp_str
-
-
-save_daily_backup = save_backup
-
-
-def list_backups(team_name):
-    """Lists available backup identifiers in descending order (newest first)."""
-    safe_team = _get_safe_team_name(team_name)
-    prefix = f"{safe_team}_"
-    pattern = os.path.join(BACKUP_DIR, f"{prefix}*.csv")
-    files = glob.glob(pattern)
-    dates = []
-    for f in files:
-        base = os.path.basename(f)
-        if base.startswith(prefix) and base.endswith(".csv"):
-            date_part = base[len(prefix):-4]
-            if not date_part.endswith("_counts"):
-                dates.append(date_part)
-    return sorted(list(set(dates)), reverse=True)
-
-
-def format_backup_label(b_str):
-    """Nicely formats backup timestamp string for selectboxes."""
-    if not b_str:
-        return ""
-    if "_" in b_str and len(b_str) >= 19:
-        parts = b_str.split("_", 1)
-        time_part = parts[1].replace("-", ":")
-        return f"{parts[0]}  at  {time_part}"
-    return b_str
-
-
-def load_backup(team_name, date_str):
-    """Loads dataframe and counts from a specified backup identifier."""
-    if not date_str:
-        return None, {}
-    safe_team = _get_safe_team_name(team_name)
-    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
-    json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
-    if not os.path.exists(csv_path):
-        return None, {}
-    df = pd.read_csv(csv_path)
-    df.columns = df.columns.astype(str).str.strip()
-    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
-    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
-    for c in df.columns:
-        if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    counts = {}
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                counts = json.load(f)
-        except Exception:
-            pass
-    return df, counts
-
-
-def compare_datasets(current_df, backup_df, disciplines):
-    """Identifies added, removed, and modified projects between current and backup data."""
-    def _make_key(row):
-        no_val = str(row.get("No.", "")).strip() if pd.notnull(row.get("No.")) else ""
-        name_val = ""
-        for k in ("project name", "project", "name", "task"):
-            col = next((c for c in row.index if k in str(c).lower()), None)
-            if col and pd.notnull(row.get(col)):
-                name_val = str(row.get(col)).strip()
-                break
-        if no_val and no_val not in ("nan", ""):
-            return f"No. {no_val} | {name_val}" if name_val else f"No. {no_val}"
-        return name_val or "Unnamed"
-
-    curr = current_df.copy()
-    back = backup_df.copy()
-    curr["_key"] = curr.apply(_make_key, axis=1)
-    back["_key"] = back.apply(_make_key, axis=1)
-
-    curr_dict = {r["_key"]: r for _, r in curr.iterrows()}
-    back_dict = {r["_key"]: r for _, r in back.iterrows()}
-
-    curr_keys = set(curr_dict.keys())
-    back_keys = set(back_dict.keys())
-
-    added_keys = sorted(list(curr_keys - back_keys))
-    removed_keys = sorted(list(back_keys - curr_keys))
-    common_keys = sorted(list(curr_keys & back_keys))
-
-    changes = []
-    hrs_cols = [f"{d} (Hrs)" for d in disciplines]
-
-    for k in common_keys:
-        r_curr = curr_dict[k]
-        r_back = back_dict[k]
-        diffs = []
-
-        # Check dates
-        s_old, s_new = r_back.get("Start Date"), r_curr.get("Start Date")
-        e_old, e_new = r_back.get("End Date"), r_curr.get("End Date")
-
-        if pd.notnull(s_old) and pd.notnull(s_new) and str(s_old) != str(s_new):
-            diffs.append(f"Start: {s_old} ➔ {s_new}")
-        elif pd.isnull(s_old) != pd.isnull(s_new):
-            diffs.append(f"Start: {s_old} ➔ {s_new}")
-
-        if pd.notnull(e_old) and pd.notnull(e_new) and str(e_old) != str(e_new):
-            diffs.append(f"End: {e_old} ➔ {e_new}")
-        elif pd.isnull(e_old) != pd.isnull(e_new):
-            diffs.append(f"End: {e_old} ➔ {e_new}")
-
-        # Check hours
-        for h_col in hrs_cols:
-            if h_col in r_curr and h_col in r_back:
-                v_old = pd.to_numeric(r_back[h_col], errors="coerce") or 0.0
-                v_new = pd.to_numeric(r_curr[h_col], errors="coerce") or 0.0
-                if abs(v_old - v_new) > 0.01:
-                    disc_name = h_col.replace(" (Hrs)", "")
-                    diffs.append(f"{disc_name} Hrs: {v_old:g} ➔ {v_new:g}")
-
-        # Check Team Count / Calculated Hours if present
-        for spec_col in ["Team Count", "Calculated Hours"]:
-            if spec_col in r_curr and spec_col in r_back:
-                v_old = pd.to_numeric(r_back[spec_col], errors="coerce") or 0.0
-                v_new = pd.to_numeric(r_curr[spec_col], errors="coerce") or 0.0
-                if abs(v_old - v_new) > 0.01:
-                    diffs.append(f"{spec_col}: {v_old:g} ➔ {v_new:g}")
-
-        if diffs:
-            changes.append({
-                "Project": k,
-                "Differences Detected": " | ".join(diffs)
-            })
-
-    return added_keys, removed_keys, changes
 
 
 # ----------------------------------------------------------------------
@@ -676,12 +511,7 @@ def render_main_overview():
         if st.button("🔄 Refresh All Sheets", use_container_width=True):
             load_from_gsheet.clear()
             load_team_counts.clear()
-            st.session_state["refresh_all_backup"] = True
             st.rerun()
-
-    do_backup_all = st.session_state.pop("refresh_all_backup", False)
-    if do_backup_all:
-        st.toast("🔄 Refreshing all sheets and archiving backups...")
 
     team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
     valid_teams = [t for t in team_order if t in TEAMS]
@@ -714,11 +544,6 @@ def render_main_overview():
                         except Exception:
                             pass
 
-                    # Auto-backup on Refresh All or if no backup exists yet
-                    if do_backup_all or not list_backups(t_name):
-                        if team_df is not None and not team_df.empty:
-                            save_backup(t_name, team_df, team_counts)
-
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
 
@@ -743,9 +568,6 @@ def render_main_overview():
                 except Exception as e:
                     st.error(f"Could not load data for {t_name}: {e}")
         st.markdown("---")
-
-    if do_backup_all:
-        st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
 
     # ------------------------------------------------------------------
     # Completed Projects Section (English Interface & Date Range Filters)
@@ -845,12 +667,9 @@ SHEET_ID = team_cfg["sheet_id"]
 CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 
 # ----------------------------------------------------------------------
-# 2e. Data Source Selection & Automatic Backup Controls
+# 2e. Live Data Loading
 # ----------------------------------------------------------------------
 st.markdown("---")
-
-# Check if a refresh was triggered
-do_refresh_backup = st.session_state.pop(f"refresh_backup_{selected_team}", False)
 
 # Fetch Live Data
 live_projects = None
@@ -868,122 +687,27 @@ try:
                 live_eng_counts = tab_c
         except Exception:
             pass
-
-    # Save backup automatically upon refresh, or on initial run if no backups exist yet
-    if (do_refresh_backup or not list_backups(selected_team)) and live_projects is not None and not live_projects.empty:
-        new_ts = save_backup(selected_team, live_projects, live_eng_counts)
-        if do_refresh_backup:
-            st.toast(f"✅ Auto-backup archived on refresh: {format_backup_label(new_ts)}")
-
 except Exception as e:
     st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
     live_projects = get_empty_template(team_mode, disciplines)
 
-# List available backups after ensuring initial/refresh backup is saved
-available_backups = list_backups(selected_team)
-
-c_mode, c_hist, c_actions = st.columns([1.8, 1.8, 2.8])
-with c_mode:
-    data_source = st.radio(
-        "📂 Data Source:",
-        ["🟢 Live Google Sheet", "🕰️ Historical Backup"],
-        horizontal=True,
-        help="Choose whether to load current live data from Google Sheet or load a previous snapshot."
-    )
-
-selected_backup_date = None
-with c_hist:
-    if data_source == "🕰️ Historical Backup":
-        if available_backups:
-            selected_backup_date = st.selectbox(
-                "📅 Select Backup Snapshot:",
-                available_backups,
-                format_func=format_backup_label,
-                index=0
-            )
-        else:
-            st.warning("No previous backups found for this team yet.")
-
-with c_actions:
-    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1.4])
-    with c_btn1:
-        refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
-    with c_btn2:
-        save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot.")
-    with c_btn3:
-        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
+c_btn1, c_btn2, _ = st.columns([1, 1.4, 3.6])
+with c_btn1:
+    refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
+with c_btn2:
+    st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
 
 if refresh_clicked:
     load_from_gsheet.clear()
     load_team_counts.clear()
     for d in disciplines:
         st.session_state.pop(f"eng_{selected_team}_{d}", None)
-    st.session_state[f"refresh_backup_{selected_team}"] = True
     st.rerun()
 
-if save_backup_now and live_projects is not None:
-    saved_ts = save_backup(selected_team, live_projects, live_eng_counts)
-    st.success(f"✅ Saved backup snapshot: {format_backup_label(saved_ts)}")
-    st.rerun()
-
-# Determine active dataset based on user selection
-counts_source = "defaults"
-if data_source == "🕰️ Historical Backup" and selected_backup_date:
-    df_projects, sheet_eng_counts = load_backup(selected_team, selected_backup_date)
-    if df_projects is None or df_projects.empty:
-        st.warning("⚠️ Could not load backup data. Reverting to live data.")
-        df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
-        sheet_eng_counts = live_eng_counts
-        counts_source = "Live Google Sheet"
-    else:
-        counts_source = f"Backup ({format_backup_label(selected_backup_date)})"
-        st.info(f"🕰️ **Viewing Historical Snapshot from {format_backup_label(selected_backup_date)}**. All calculations and timelines below reflect this snapshot.")
-else:
-    df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
-    sheet_eng_counts = live_eng_counts
-    counts_source = "Live Google Sheet"
-    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
-
-# ----------------------------------------------------------------------
-# 2f. Differences & Change Comparison
-# ----------------------------------------------------------------------
-with st.expander("🔍 Compare Changes with a Previous Backup"):
-    cmp_backups = list_backups(selected_team)
-    if not cmp_backups:
-        st.info("No saved backup files available to compare.")
-    elif live_projects is None:
-        st.warning("Live data not available to compare.")
-    else:
-        cmp_date = st.selectbox(
-            "Select historical backup to compare against current live data:",
-            cmp_backups,
-            format_func=format_backup_label,
-            key="cmp_date"
-        )
-        hist_df, hist_counts = load_backup(selected_team, cmp_date)
-        if hist_df is not None:
-            added, removed, modified = compare_datasets(live_projects, hist_df, disciplines)
-
-            m_c1, m_c2, m_c3 = st.columns(3)
-            m_c1.metric("🆕 New Projects Added", len(added))
-            m_c2.metric("❌ Removed / Completed", len(removed))
-            m_c3.metric("🔄 Modified Projects", len(modified))
-
-            if added:
-                st.markdown("**🆕 Projects added in current data:**")
-                st.write(", ".join(added))
-
-            if removed:
-                st.markdown("**❌ Projects present in backup but missing in current data:**")
-                st.write(", ".join(removed))
-
-            if modified:
-                st.markdown("**🔄 Detailed Project Differences (Start, End, or Allocated Hours):**")
-                st.dataframe(pd.DataFrame(modified), use_container_width=True, hide_index=True)
-
-            if not added and not removed and not modified:
-                st.success("✅ Identical: No differences detected between current data and this backup.")
+df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+sheet_eng_counts = live_eng_counts
+counts_source = "Live Google Sheet"
+st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet.")
 
 # ----------------------------------------------------------------------
 # 3. Sidebar - Capacity Settings
@@ -1009,7 +733,7 @@ efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
 
 for disc, default in zip(disciplines, default_engineers):
     engineers[disc] = st.sidebar.number_input(
-        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{data_source}_{selected_backup_date}_{disc}"
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{disc}"
     )
     capacities[disc] = engineers[disc] * hours_per_day * efficiency
 
@@ -1021,11 +745,11 @@ st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
 # 4. Project table
 # ----------------------------------------------------------------------
 st.subheader("📋 Project Register & Hours Allocation")
-st.caption("Changes made in this table are temporary (for what-if analysis). To preserve changes, update Google Sheets or save a backup.")
+st.caption("Changes made in this table are temporary (for what-if analysis). To preserve changes, update Google Sheets.")
 
 edited_df = st.data_editor(
     df_projects,
-    key=f"editor_{selected_team}_{data_source}_{selected_backup_date}",
+    key=f"editor_{selected_team}",
     num_rows="dynamic",
     use_container_width=True,
     hide_index=True,
