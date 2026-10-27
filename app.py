@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import datetime
 from urllib.parse import quote
 
@@ -14,6 +15,9 @@ import altair as alt
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
+
+BACKUP_DIR = "backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
 TEAMS = {
@@ -78,6 +82,165 @@ DATA_COLS = list({
 NP_WEEKMASK = "1111001"
 PD_WEEKMASK = "Sun Mon Tue Wed Thu"
 HOURS_PER_DAY = 8
+
+
+# ----------------------------------------------------------------------
+# 1b. Backup Management System (Timestamped Snapshots & Differences)
+# ----------------------------------------------------------------------
+def _get_safe_team_name(team_name):
+    return "".join(c for c in team_name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+
+
+def save_backup(team_name, df, counts=None, timestamp_str=None):
+    """Saves a backup CSV (and optional JSON counts) with timestamp."""
+    if df is None or df.empty:
+        return None
+    if timestamp_str is None:
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_team = _get_safe_team_name(team_name)
+    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}.csv")
+    df.to_csv(csv_path, index=False)
+    if counts is not None:
+        json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{timestamp_str}_counts.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(counts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return timestamp_str
+
+
+save_daily_backup = save_backup
+
+
+def list_backups(team_name):
+    """Lists available backup identifiers in descending order (newest first)."""
+    safe_team = _get_safe_team_name(team_name)
+    prefix = f"{safe_team}_"
+    pattern = os.path.join(BACKUP_DIR, f"{prefix}*.csv")
+    files = glob.glob(pattern)
+    dates = []
+    for f in files:
+        base = os.path.basename(f)
+        if base.startswith(prefix) and base.endswith(".csv"):
+            date_part = base[len(prefix):-4]
+            if not date_part.endswith("_counts"):
+                dates.append(date_part)
+    return sorted(list(set(dates)), reverse=True)
+
+
+def format_backup_label(b_str):
+    """Nicely formats backup timestamp string for selectboxes."""
+    if not b_str:
+        return ""
+    if "_" in b_str and len(b_str) >= 19:
+        parts = b_str.split("_", 1)
+        time_part = parts[1].replace("-", ":")
+        return f"{parts[0]}  at  {time_part}"
+    return b_str
+
+
+def load_backup(team_name, date_str):
+    """Loads dataframe and counts from a specified backup identifier."""
+    if not date_str:
+        return None, {}
+    safe_team = _get_safe_team_name(team_name)
+    csv_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}.csv")
+    json_path = os.path.join(BACKUP_DIR, f"{safe_team}_{date_str}_counts.json")
+    if not os.path.exists(csv_path):
+        return None, {}
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.astype(str).str.strip()
+    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
+    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
+    for c in df.columns:
+        if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    counts = {}
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                counts = json.load(f)
+        except Exception:
+            pass
+    return df, counts
+
+
+def compare_datasets(current_df, backup_df, disciplines):
+    """Identifies added, removed, and modified projects between current and backup data."""
+    def _make_key(row):
+        no_val = str(row.get("No.", "")).strip() if pd.notnull(row.get("No.")) else ""
+        name_val = ""
+        for k in ("project name", "project", "name", "task"):
+            col = next((c for c in row.index if k in str(c).lower()), None)
+            if col and pd.notnull(row.get(col)):
+                name_val = str(row.get(col)).strip()
+                break
+        if no_val and no_val not in ("nan", ""):
+            return f"No. {no_val} | {name_val}" if name_val else f"No. {no_val}"
+        return name_val or "Unnamed"
+
+    curr = current_df.copy()
+    back = backup_df.copy()
+    curr["_key"] = curr.apply(_make_key, axis=1)
+    back["_key"] = back.apply(_make_key, axis=1)
+
+    curr_dict = {r["_key"]: r for _, r in curr.iterrows()}
+    back_dict = {r["_key"]: r for _, r in back.iterrows()}
+
+    curr_keys = set(curr_dict.keys())
+    back_keys = set(back_dict.keys())
+
+    added_keys = sorted(list(curr_keys - back_keys))
+    removed_keys = sorted(list(back_keys - curr_keys))
+    common_keys = sorted(list(curr_keys & back_keys))
+
+    changes = []
+    hrs_cols = [f"{d} (Hrs)" for d in disciplines]
+
+    for k in common_keys:
+        r_curr = curr_dict[k]
+        r_back = back_dict[k]
+        diffs = []
+
+        # Check dates
+        s_old, s_new = r_back.get("Start Date"), r_curr.get("Start Date")
+        e_old, e_new = r_back.get("End Date"), r_curr.get("End Date")
+
+        if pd.notnull(s_old) and pd.notnull(s_new) and str(s_old) != str(s_new):
+            diffs.append(f"Start: {s_old} ➔ {s_new}")
+        elif pd.isnull(s_old) != pd.isnull(s_new):
+            diffs.append(f"Start: {s_old} ➔ {s_new}")
+
+        if pd.notnull(e_old) and pd.notnull(e_new) and str(e_old) != str(e_new):
+            diffs.append(f"End: {e_old} ➔ {e_new}")
+        elif pd.isnull(e_old) != pd.isnull(e_new):
+            diffs.append(f"End: {e_old} ➔ {e_new}")
+
+        # Check hours
+        for h_col in hrs_cols:
+            if h_col in r_curr and h_col in r_back:
+                v_old = pd.to_numeric(r_back[h_col], errors="coerce") or 0.0
+                v_new = pd.to_numeric(r_curr[h_col], errors="coerce") or 0.0
+                if abs(v_old - v_new) > 0.01:
+                    disc_name = h_col.replace(" (Hrs)", "")
+                    diffs.append(f"{disc_name} Hrs: {v_old:g} ➔ {v_new:g}")
+
+        # Check Team Count / Calculated Hours if present
+        for spec_col in ["Team Count", "Calculated Hours"]:
+            if spec_col in r_curr and spec_col in r_back:
+                v_old = pd.to_numeric(r_back[spec_col], errors="coerce") or 0.0
+                v_new = pd.to_numeric(r_curr[spec_col], errors="coerce") or 0.0
+                if abs(v_old - v_new) > 0.01:
+                    diffs.append(f"{spec_col}: {v_old:g} ➔ {v_new:g}")
+
+        if diffs:
+            changes.append({
+                "Project": k,
+                "Differences Detected": " | ".join(diffs)
+            })
+
+    return added_keys, removed_keys, changes
 
 
 # ----------------------------------------------------------------------
@@ -347,6 +510,7 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
     calc_df = df.copy()
     count_col = find_count_col(calc_df)
 
+    # Ensure Start and End Date are safe date objects and handle missing dates
     calc_df["Start Date"] = pd.to_datetime(calc_df["Start Date"], errors="coerce").dt.date
     calc_df["End Date"] = pd.to_datetime(calc_df["End Date"], errors="coerce").dt.date
     calc_df["End Date"] = calc_df["End Date"].fillna(calc_df["Start Date"])
@@ -359,6 +523,7 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
         calc_from_count = False
         if sheet_hrs_col is not None and sheet_hrs_col in calc_df.columns:
             calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce")
+            # If values in Calculated Hours are missing or 0, calculate dynamically
             if calc_df[hrs_col_name].isna().all() or (calc_df[hrs_col_name] == 0).all():
                 calc_from_count = True
             else:
@@ -388,6 +553,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
     gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
 
+    # If End Date was omitted or empty, set to Start Date
     gantt_df["End"] = gantt_df["End"].fillna(gantt_df["Start"])
     gantt_df["Start"] = gantt_df["Start"].fillna(gantt_df["End"])
 
@@ -405,6 +571,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
 
+    # Prevent Altair from grouping projects with identical names onto the same row
     if gantt_df["Project"].duplicated().any():
         seen = {}
         unique_labels = []
@@ -414,6 +581,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
             unique_labels.append(f"{p} ({count})" if count > 1 else p)
         gantt_df["Project"] = unique_labels
 
+    # 1-day tasks must have EndPlus = End + 1 day so the bar spans the full day
     gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
     gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
 
@@ -451,6 +619,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         *extra_tooltips,
     ]
 
+    # Main horizontal bar layer
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
         y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=250)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
@@ -459,6 +628,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         tooltip=tooltip_items,
     )
 
+    # Highlight same-day tasks with diamond marker so they stand out clearly regardless of timeline zoom
     same_day_df = gantt_df[gantt_df["Start"].dt.date == gantt_df["End"].dt.date]
     point_layer = None
     if not same_day_df.empty:
@@ -506,7 +676,12 @@ def render_main_overview():
         if st.button("🔄 Refresh All Sheets", use_container_width=True):
             load_from_gsheet.clear()
             load_team_counts.clear()
+            st.session_state["refresh_all_backup"] = True
             st.rerun()
+
+    do_backup_all = st.session_state.pop("refresh_all_backup", False)
+    if do_backup_all:
+        st.toast("🔄 Refreshing all sheets and archiving backups...")
 
     team_order = ["BIM Team", "Tech Team", "Design Team", "QC Team"]
     valid_teams = [t for t in team_order if t in TEAMS]
@@ -514,6 +689,7 @@ def render_main_overview():
     all_completed_projects = []
     today = datetime.date.today()
 
+    # Render pairs of 2 teams side-by-side
     for i in range(0, len(valid_teams), 2):
         pair = valid_teams[i:i + 2]
         cols = st.columns(2)
@@ -525,6 +701,7 @@ def render_main_overview():
                     csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
                     team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"])
 
+                    # Also fetch team counts tab if configured
                     if cfg.get("count_sheet") or cfg.get("count_gid") is not None:
                         if cfg.get("count_gid") is not None:
                             c_url = build_csv_url(cfg["sheet_id"], cfg["count_gid"])
@@ -537,9 +714,15 @@ def render_main_overview():
                         except Exception:
                             pass
 
+                    # Auto-backup on Refresh All or if no backup exists yet
+                    if do_backup_all or not list_backups(t_name):
+                        if team_df is not None and not team_df.empty:
+                            save_backup(t_name, team_df, team_counts)
+
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
 
+                    # Collect completed projects for this team
                     name_col = find_name_col(team_calc_df)
                     for _, r in team_calc_df.iterrows():
                         e_date = r.get("End Date")
@@ -561,7 +744,12 @@ def render_main_overview():
                     st.error(f"Could not load data for {t_name}: {e}")
         st.markdown("---")
 
-    # Completed Projects Section
+    if do_backup_all:
+        st.success("✅ Refreshed all sheets and automatically archived backup snapshots for each team.")
+
+    # ------------------------------------------------------------------
+    # Completed Projects Section (English Interface & Date Range Filters)
+    # ------------------------------------------------------------------
     st.subheader("🏁 Completed Projects Register")
 
     if not all_completed_projects:
@@ -604,6 +792,7 @@ def render_main_overview():
             )
             filtered_comp = comp_df[mask].sort_values("End Date", ascending=False).reset_index(drop=True)
 
+        # Summary metrics
         metric_cols = st.columns(len(selected_teams) + 1)
         metric_cols[0].metric("📊 Total Completed", len(filtered_comp))
         for idx, t in enumerate(selected_teams):
@@ -612,6 +801,7 @@ def render_main_overview():
 
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
+        # Tabs for unified view and per-team breakdown
         tab_labels = [f"📋 All Departments ({len(filtered_comp)})"] + [
             f"👥 {t} ({len(filtered_comp[filtered_comp['Department'] == t])})"
             for t in selected_teams
@@ -655,14 +845,334 @@ SHEET_ID = team_cfg["sheet_id"]
 CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 
 # ----------------------------------------------------------------------
-# Data Loading & Controls
+# 2e. Data Source Selection & Automatic Backup Controls
 # ----------------------------------------------------------------------
 st.markdown("---")
 
+# Check if a refresh was triggered
+do_refresh_backup = st.session_state.pop(f"refresh_backup_{selected_team}", False)
+
+# Fetch Live Data
 live_projects = None
 live_eng_counts = {}
 try:
     live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
     if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
         if team_cfg.get("count_gid") is not None:
-            c_url = build_csv_url
+            c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
+        else:
+            c_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
+        try:
+            tab_c = load_team_counts(c_url, disciplines)
+            if tab_c:
+                live_eng_counts = tab_c
+        except Exception:
+            pass
+
+    # Save backup automatically upon refresh, or on initial run if no backups exist yet
+    if (do_refresh_backup or not list_backups(selected_team)) and live_projects is not None and not live_projects.empty:
+        new_ts = save_backup(selected_team, live_projects, live_eng_counts)
+        if do_refresh_backup:
+            st.toast(f"✅ Auto-backup archived on refresh: {format_backup_label(new_ts)}")
+
+except Exception as e:
+    st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
+    live_projects = get_empty_template(team_mode, disciplines)
+
+# List available backups after ensuring initial/refresh backup is saved
+available_backups = list_backups(selected_team)
+
+c_mode, c_hist, c_actions = st.columns([1.8, 1.8, 2.8])
+with c_mode:
+    data_source = st.radio(
+        "📂 Data Source:",
+        ["🟢 Live Google Sheet", "🕰️ Historical Backup"],
+        horizontal=True,
+        help="Choose whether to load current live data from Google Sheet or load a previous snapshot."
+    )
+
+selected_backup_date = None
+with c_hist:
+    if data_source == "🕰️ Historical Backup":
+        if available_backups:
+            selected_backup_date = st.selectbox(
+                "📅 Select Backup Snapshot:",
+                available_backups,
+                format_func=format_backup_label,
+                index=0
+            )
+        else:
+            st.warning("No previous backups found for this team yet.")
+
+with c_actions:
+    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1.4])
+    with c_btn1:
+        refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
+    with c_btn2:
+        save_backup_now = st.button("💾 Save Backup", use_container_width=True, help="Immediately save current data as a backup snapshot.")
+    with c_btn3:
+        st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
+
+if refresh_clicked:
+    load_from_gsheet.clear()
+    load_team_counts.clear()
+    for d in disciplines:
+        st.session_state.pop(f"eng_{selected_team}_{d}", None)
+    st.session_state[f"refresh_backup_{selected_team}"] = True
+    st.rerun()
+
+if save_backup_now and live_projects is not None:
+    saved_ts = save_backup(selected_team, live_projects, live_eng_counts)
+    st.success(f"✅ Saved backup snapshot: {format_backup_label(saved_ts)}")
+    st.rerun()
+
+# Determine active dataset based on user selection
+counts_source = "defaults"
+if data_source == "🕰️ Historical Backup" and selected_backup_date:
+    df_projects, sheet_eng_counts = load_backup(selected_team, selected_backup_date)
+    if df_projects is None or df_projects.empty:
+        st.warning("⚠️ Could not load backup data. Reverting to live data.")
+        df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+        sheet_eng_counts = live_eng_counts
+        counts_source = "Live Google Sheet"
+    else:
+        counts_source = f"Backup ({format_backup_label(selected_backup_date)})"
+        st.info(f"🕰️ **Viewing Historical Snapshot from {format_backup_label(selected_backup_date)}**. All calculations and timelines below reflect this snapshot.")
+else:
+    df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+    sheet_eng_counts = live_eng_counts
+    counts_source = "Live Google Sheet"
+    st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet (Auto-backup enabled on refresh).")
+
+# ----------------------------------------------------------------------
+# 2f. Differences & Change Comparison
+# ----------------------------------------------------------------------
+with st.expander("🔍 Compare Changes with a Previous Backup"):
+    cmp_backups = list_backups(selected_team)
+    if not cmp_backups:
+        st.info("No saved backup files available to compare.")
+    elif live_projects is None:
+        st.warning("Live data not available to compare.")
+    else:
+        cmp_date = st.selectbox(
+            "Select historical backup to compare against current live data:",
+            cmp_backups,
+            format_func=format_backup_label,
+            key="cmp_date"
+        )
+        hist_df, hist_counts = load_backup(selected_team, cmp_date)
+        if hist_df is not None:
+            added, removed, modified = compare_datasets(live_projects, hist_df, disciplines)
+
+            m_c1, m_c2, m_c3 = st.columns(3)
+            m_c1.metric("🆕 New Projects Added", len(added))
+            m_c2.metric("❌ Removed / Completed", len(removed))
+            m_c3.metric("🔄 Modified Projects", len(modified))
+
+            if added:
+                st.markdown("**🆕 Projects added in current data:**")
+                st.write(", ".join(added))
+
+            if removed:
+                st.markdown("**❌ Projects present in backup but missing in current data:**")
+                st.write(", ".join(removed))
+
+            if modified:
+                st.markdown("**🔄 Detailed Project Differences (Start, End, or Allocated Hours):**")
+                st.dataframe(pd.DataFrame(modified), use_container_width=True, hide_index=True)
+
+            if not added and not removed and not modified:
+                st.success("✅ Identical: No differences detected between current data and this backup.")
+
+# ----------------------------------------------------------------------
+# 3. Sidebar - Capacity Settings
+# ----------------------------------------------------------------------
+st.sidebar.header("⚙️ Team Capacity Settings")
+st.sidebar.caption(f"Team: **{selected_team}**")
+st.sidebar.caption(f"Engineers count source: {counts_source}")
+hours_per_day = st.sidebar.number_input(
+    "Working Hours per Day (per engineer)",
+    min_value=1.0, max_value=12.0, value=float(HOURS_PER_DAY), step=0.5,
+    help="Daily capacity = Engineers × Hours per Day × Efficiency Factor.",
+)
+st.sidebar.markdown("Set the number of available engineers:")
+
+default_engineers = [
+    sheet_eng_counts.get(disc, fallback)
+    for disc, fallback in zip(disciplines, team_cfg["engineers"])
+]
+
+engineers = {}
+capacities = {}
+efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, 80) / 100.0
+
+for disc, default in zip(disciplines, default_engineers):
+    engineers[disc] = st.sidebar.number_input(
+        f"{disc} Engineers", value=int(default), min_value=0, key=f"eng_{selected_team}_{data_source}_{selected_backup_date}_{disc}"
+    )
+    capacities[disc] = engineers[disc] * hours_per_day * efficiency
+
+total_team_engineers = sum(engineers.values())
+st.sidebar.markdown("---")
+st.sidebar.metric("👥 Total Team Engineers", total_team_engineers)
+
+# ----------------------------------------------------------------------
+# 4. Project table
+# ----------------------------------------------------------------------
+st.subheader("📋 Project Register & Hours Allocation")
+st.caption("Changes made in this table are temporary (for what-if analysis). To preserve changes, update Google Sheets or save a backup.")
+
+edited_df = st.data_editor(
+    df_projects,
+    key=f"editor_{selected_team}_{data_source}_{selected_backup_date}",
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+)
+
+# ----------------------------------------------------------------------
+# 4a. Prepare hours column in background
+# ----------------------------------------------------------------------
+calc_df, count_col = prepare_calc_df(edited_df, team_mode, disciplines, hours_per_day)
+
+# ----------------------------------------------------------------------
+# 4b. Project Timeline (Gantt Chart)
+# ----------------------------------------------------------------------
+st.markdown("---")
+st.subheader("🗓️ Project Timeline (Gantt Chart)")
+
+hide_completed = st.checkbox("Filter completed", value=False, key=f"hide_comp_{selected_team}")
+render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_completed)
+
+# ----------------------------------------------------------------------
+# 5. Calculation Engine (daily, Sunday - Thursday)
+# ----------------------------------------------------------------------
+st.markdown("---")
+st.subheader("🔥 Daily Bottleneck Analysis & Executive Dashboard")
+
+col1, col2 = st.columns(2)
+with col1:
+    start_timeline = st.date_input("Timeline Start Date:", value=datetime.date.today())
+with col2:
+    num_weeks = st.slider("Number of Weeks to Analyze:", 1, 12, 4)
+
+num_days = num_weeks * 5
+days = [d.date() for d in pd.bdate_range(start=start_timeline, periods=num_days, freq="C", weekmask=PD_WEEKMASK)]
+day_labels = [d.strftime("%a %d-%b") for d in days]
+
+demand = {disc: [0.0] * num_days for disc in disciplines}
+
+for idx, row in calc_df.iterrows():
+    if pd.isnull(row.get("Start Date")) or pd.isnull(row.get("End Date")):
+        continue
+
+    s_date = row["Start Date"]
+    e_date = row["End Date"]
+    if isinstance(s_date, str):
+        s_date = pd.to_datetime(s_date, errors="coerce").date()
+    if isinstance(e_date, str):
+        e_date = pd.to_datetime(e_date, errors="coerce").date()
+
+    if not s_date or not e_date:
+        continue
+
+    workdays_total = np.busday_count(s_date, e_date + datetime.timedelta(days=1), weekmask=NP_WEEKMASK)
+    if workdays_total <= 0:
+        if s_date == e_date:
+            workdays_total = 1
+        else:
+            continue
+
+    for disc in disciplines:
+        col_name = f"{disc} (Hrs)"
+        if col_name not in row or pd.isnull(row.get(col_name)):
+            continue
+
+        try:
+            total_hrs = float(row[col_name])
+        except (ValueError, TypeError):
+            continue
+
+        daily_rate = total_hrs / workdays_total
+
+        for i, day in enumerate(days):
+            if s_date <= day <= e_date:
+                demand[disc][i] += daily_rate
+
+# ----------------------------------------------------------------------
+# 6. Display Charts and Tables
+# ----------------------------------------------------------------------
+tabs = st.tabs(disciplines)
+
+
+def highlight_bottlenecks(val):
+    if isinstance(val, (int, float)) and val < 0:
+        return "background-color: #ffcccc; color: #900000; font-weight: bold"
+    return ""
+
+
+for idx, disc in enumerate(disciplines):
+    with tabs[idx]:
+        team_title = disc if disc.endswith("Team") else f"{disc} Team"
+        st.markdown(f"### {team_title} Analysis (Daily)")
+
+        results_df = pd.DataFrame({
+            "Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Shortage/Surplus)"],
+        })
+
+        var_list, dem_list, cap_list = [], [], []
+
+        for i, d_label in enumerate(day_labels):
+            dem = round(demand[disc][i], 1)
+            cap = capacities[disc]
+            var = round(cap - dem, 1)
+
+            results_df[d_label] = [dem, cap, var]
+            var_list.append(var)
+            dem_list.append(dem)
+            cap_list.append(cap)
+
+        short_days = [(day_labels[i], v) for i, v in enumerate(var_list) if v < 0]
+        if short_days:
+            worst = min(short_days, key=lambda x: x[1])
+            st.warning(f"⚠️ {len(short_days)} bottleneck day(s) out of {num_days}. Worst: **{worst[0]}** ({worst[1]:.2f} hrs).")
+        else:
+            st.success("✅ No bottlenecks in the selected period.")
+
+        st.dataframe(
+            results_df.style
+                .map(highlight_bottlenecks, subset=day_labels)
+                .format("{:.2f}", subset=day_labels),
+            use_container_width=True,
+        )
+
+        chart_data = pd.DataFrame({
+            "Day": day_labels,
+            "Variance (Shortage/Surplus)": var_list,
+            "Demand": dem_list,
+            "Capacity": cap_list,
+        })
+        chart_data["Color"] = np.where(chart_data["Variance (Shortage/Surplus)"] >= 0, "#2ca02c", "#d62728")
+
+        st.markdown("#### 📉 Daily Variance Chart (Dips below 0 indicate bottlenecks)")
+        variance_chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X("Day:N", sort=day_labels, title="Day", axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("Variance (Shortage/Surplus):Q", title="Variance (Shortage/Surplus)"),
+            color=alt.Color("Color:N", scale=None),
+            tooltip=["Day", "Variance (Shortage/Surplus)", "Demand", "Capacity"],
+        )
+        st.altair_chart(variance_chart, use_container_width=True)
+
+        st.markdown("#### 📈 Daily Demand vs Capacity Trend")
+        trend_df = chart_data.melt(
+            id_vars="Day", value_vars=["Demand", "Capacity"],
+            var_name="Metric", value_name="Hours",
+        )
+        trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
+            x=alt.X("Day:N", sort=day_labels, title="Day", axis=alt.Axis(labelAngle=-90)),
+            y=alt.Y("Hours:Q"),
+            color=alt.Color("Metric:N"),
+            tooltip=["Day", "Metric", "Hours"],
+        )
+        st.altair_chart(trend_chart, use_container_width=True)
