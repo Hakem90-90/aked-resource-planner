@@ -13,6 +13,9 @@ import altair as alt
 st.set_page_config(page_title="Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
+# Maximum number of project rows read from each Google Sheet
+MAX_ROWS = 50
+
 # ----- Teams: each team has its own Google Sheet and default number of engineers -----
 TEAMS = {
     "Tech Team": {
@@ -29,21 +32,21 @@ TEAMS = {
         "gid": None,
         "mode": "team_count",
         "disciplines": ["Arch Design Team"],
-        "engineers": [21],  # Fallback default from sheet (Total = 21)
+        "engineers": [21],
     },
     "BIM Team": {
         "sheet_id": "1g9lFbLem738PcQ3FOWGjXZJopwWnf2g5-ncS6dUwNn8",
         "gid": None,
         "mode": "team_count",
         "disciplines": ["BIM Team"],
-        "engineers": [3],  # Fallback default from sheet (Total = 3)
+        "engineers": [3],
     },
     "QC Team": {
         "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
         "gid": None,
         "mode": "hours",
         "disciplines": ["Arch", "Structural", "MEP", "Electrical"],
-        "engineers": [2, 1, 1, 2],  # Fallback defaults (Total = 6)
+        "engineers": [2, 1, 1, 2],
     },
 }
 
@@ -101,6 +104,15 @@ def get_empty_template(mode="hours", disciplines=None):
     for d in (disciplines or ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]):
         data[f"{d} (Hrs)"] = [40.0]
     return pd.DataFrame(data)
+
+
+def parse_dates(series):
+    """Parse mixed date formats safely (e.g. 2026-10-18 and 11/1/2026)."""
+    try:
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        parsed = pd.to_datetime(series, errors="coerce")
+    return parsed.dt.date
 
 
 def match_discipline_name(raw_name, disciplines):
@@ -182,7 +194,7 @@ def load_team_counts(url, disciplines):
 
 
 @st.cache_data(ttl=60, show_spinner="Loading data from Google Sheet...")
-def load_from_gsheet(url, disciplines):
+def load_from_gsheet(url, disciplines, max_rows=MAX_ROWS):
     raw_df = pd.read_csv(url)
     raw_df.columns = raw_df.columns.astype(str).str.strip()
 
@@ -255,9 +267,10 @@ def load_from_gsheet(url, disciplines):
         disc_col_idx = None
         cnt_col_idx = None
 
+        # Only cut the table where a cell is EXACTLY "Discipline"
         for idx, row in raw_df.iterrows():
             for col_i, val in enumerate(row):
-                if pd.notnull(val) and "discipline" in str(val).lower():
+                if pd.notnull(val) and str(val).strip().lower() == "discipline":
                     split_idx = idx
                     disc_col_idx = col_i
                     for c_j in range(col_i + 1, len(row)):
@@ -287,8 +300,12 @@ def load_from_gsheet(url, disciplines):
             df = raw_df.copy()
 
     df = df.dropna(how="all").reset_index(drop=True)
-    df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce").dt.date
-    df["End Date"] = pd.to_datetime(df["End Date"], errors="coerce").dt.date
+
+    # ---- Keep only the first `max_rows` project rows ----
+    df = df.head(max_rows).copy()
+
+    df["Start Date"] = parse_dates(df["Start Date"])
+    df["End Date"] = parse_dates(df["End Date"])
     for c in df.columns:
         if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -345,9 +362,8 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
     calc_df = df.copy()
     count_col = find_count_col(calc_df)
 
-    # Ensure Start and End Date are safe date objects and handle missing dates
-    calc_df["Start Date"] = pd.to_datetime(calc_df["Start Date"], errors="coerce").dt.date
-    calc_df["End Date"] = pd.to_datetime(calc_df["End Date"], errors="coerce").dt.date
+    calc_df["Start Date"] = parse_dates(calc_df["Start Date"])
+    calc_df["End Date"] = parse_dates(calc_df["End Date"])
     calc_df["End Date"] = calc_df["End Date"].fillna(calc_df["Start Date"])
     calc_df["Start Date"] = calc_df["Start Date"].fillna(calc_df["End Date"])
 
@@ -358,7 +374,6 @@ def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
         calc_from_count = False
         if sheet_hrs_col is not None and sheet_hrs_col in calc_df.columns:
             calc_df[hrs_col_name] = pd.to_numeric(calc_df[sheet_hrs_col], errors="coerce")
-            # If values in Calculated Hours are missing or 0, calculate dynamically
             if calc_df[hrs_col_name].isna().all() or (calc_df[hrs_col_name] == 0).all():
                 calc_from_count = True
             else:
@@ -388,16 +403,33 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     gantt_df["Start"] = pd.to_datetime(gantt_df["Start Date"], errors="coerce")
     gantt_df["End"] = pd.to_datetime(gantt_df["End Date"], errors="coerce")
 
-    # If End Date was omitted or empty, set to Start Date
     gantt_df["End"] = gantt_df["End"].fillna(gantt_df["Start"])
     gantt_df["Start"] = gantt_df["Start"].fillna(gantt_df["End"])
 
+    total_rows = len(gantt_df)
     gantt_df = gantt_df.dropna(subset=["Start", "End"])
+    invalid_dates = total_rows - len(gantt_df)
     gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
+    reversed_dates = total_rows - invalid_dates - len(gantt_df)
 
     today = pd.Timestamp.today().normalize()
+    hidden_completed = 0
     if hide_completed:
+        before = len(gantt_df)
         gantt_df = gantt_df[gantt_df["End"] >= today]
+        hidden_completed = before - len(gantt_df)
+
+    notes = []
+    if invalid_dates:
+        notes.append(f"{invalid_dates} row(s) with unreadable dates")
+    if reversed_dates:
+        notes.append(f"{reversed_dates} row(s) where End Date is before Start Date")
+    if hidden_completed:
+        notes.append(f"{hidden_completed} completed row(s) hidden by the filter")
+    st.caption(
+        f"Rows read: {total_rows} | Rows shown in chart: {len(gantt_df)}"
+        + (f" | Not shown: {'; '.join(notes)}" if notes else "")
+    )
 
     if gantt_df.empty:
         st.info("No ongoing or upcoming projects with valid dates to display.")
@@ -406,7 +438,7 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
 
-    # Prevent Altair from grouping projects with identical names onto the same row
+    # Prevent Altair from merging projects with identical names onto the same row
     if gantt_df["Project"].duplicated().any():
         seen = {}
         unique_labels = []
@@ -416,9 +448,10 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
             unique_labels.append(f"{p} ({count})" if count > 1 else p)
         gantt_df["Project"] = unique_labels
 
-    # 1-day tasks must have EndPlus = End + 1 day so the bar spans the full day
     gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
-    gantt_df["TotalHrs"] = gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
+    gantt_df["TotalHrs"] = (
+        gantt_df[hrs_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1) if hrs_cols else 0.0
+    )
 
     def _calc_workdays(s, e):
         try:
@@ -454,7 +487,6 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         *extra_tooltips,
     ]
 
-    # Main horizontal bar layer
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
         y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=250)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
@@ -463,7 +495,6 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
         tooltip=tooltip_items,
     )
 
-    # Highlight same-day tasks with diamond marker so they stand out clearly regardless of timeline zoom
     same_day_df = gantt_df[gantt_df["Start"].dt.date == gantt_df["End"].dt.date]
     point_layer = None
     if not same_day_df.empty:
@@ -519,7 +550,6 @@ def render_main_overview():
     all_completed_projects = []
     today = datetime.date.today()
 
-    # Render pairs of 2 teams side-by-side
     for i in range(0, len(valid_teams), 2):
         pair = valid_teams[i:i + 2]
         cols = st.columns(2)
@@ -529,25 +559,11 @@ def render_main_overview():
                 st.markdown(f"### 👥 {t_name}")
                 try:
                     csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
-                    team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"])
-
-                    # Also fetch team counts tab if configured
-                    if cfg.get("count_sheet") or cfg.get("count_gid") is not None:
-                        if cfg.get("count_gid") is not None:
-                            c_url = build_csv_url(cfg["sheet_id"], cfg["count_gid"])
-                        else:
-                            c_url = build_sheet_name_url(cfg["sheet_id"], cfg["count_sheet"])
-                        try:
-                            tab_c = load_team_counts(c_url, cfg["disciplines"])
-                            if tab_c:
-                                team_counts = tab_c
-                        except Exception:
-                            pass
+                    team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"], MAX_ROWS)
 
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
 
-                    # Collect completed projects for this team
                     name_col = find_name_col(team_calc_df)
                     for _, r in team_calc_df.iterrows():
                         e_date = r.get("End Date")
@@ -570,7 +586,7 @@ def render_main_overview():
         st.markdown("---")
 
     # ------------------------------------------------------------------
-    # Completed Projects Section (English Interface & Date Range Filters)
+    # Completed Projects Section
     # ------------------------------------------------------------------
     st.subheader("🏁 Completed Projects Register")
 
@@ -591,17 +607,9 @@ def render_main_overview():
                 key="completed_team_filter"
             )
         with f_col2:
-            start_date_filter = st.date_input(
-                "📅 End Date (From):",
-                value=min_date,
-                key="completed_start_date"
-            )
+            start_date_filter = st.date_input("📅 End Date (From):", value=min_date, key="completed_start_date")
         with f_col3:
-            end_date_filter = st.date_input(
-                "📅 End Date (To):",
-                value=max_date,
-                key="completed_end_date"
-            )
+            end_date_filter = st.date_input("📅 End Date (To):", value=max_date, key="completed_end_date")
 
         if start_date_filter > end_date_filter:
             st.warning("⚠️ Start Date must be before or equal to End Date.")
@@ -614,7 +622,6 @@ def render_main_overview():
             )
             filtered_comp = comp_df[mask].sort_values("End Date", ascending=False).reset_index(drop=True)
 
-        # Summary metrics
         metric_cols = st.columns(len(selected_teams) + 1)
         metric_cols[0].metric("📊 Total Completed", len(filtered_comp))
         for idx, t in enumerate(selected_teams):
@@ -623,7 +630,6 @@ def render_main_overview():
 
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
-        # Tabs for unified view and per-team breakdown
         tab_labels = [f"📋 All Departments ({len(filtered_comp)})"] + [
             f"👥 {t} ({len(filtered_comp[filtered_comp['Department'] == t])})"
             for t in selected_teams
@@ -671,11 +677,10 @@ CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
 # ----------------------------------------------------------------------
 st.markdown("---")
 
-# Fetch Live Data
 live_projects = None
 live_eng_counts = {}
 try:
-    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines)
+    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines, MAX_ROWS)
     if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
         if team_cfg.get("count_gid") is not None:
             c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
@@ -707,7 +712,8 @@ if refresh_clicked:
 df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
 sheet_eng_counts = live_eng_counts
 counts_source = "Live Google Sheet"
-st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet.")
+st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet "
+           f"(first {MAX_ROWS} rows read — {len(df_projects)} rows loaded).")
 
 # ----------------------------------------------------------------------
 # 3. Sidebar - Capacity Settings
@@ -759,6 +765,11 @@ edited_df = st.data_editor(
 # 4a. Prepare hours column in background
 # ----------------------------------------------------------------------
 calc_df, count_col = prepare_calc_df(edited_df, team_mode, disciplines, hours_per_day)
+
+bad_rows = calc_df[calc_df["Start Date"].isna() | calc_df["End Date"].isna()]
+if not bad_rows.empty:
+    st.warning(f"⚠️ {len(bad_rows)} row(s) have invalid dates and will not appear in the charts:")
+    st.dataframe(bad_rows, use_container_width=True)
 
 # ----------------------------------------------------------------------
 # 4b. Project Timeline (Gantt Chart)
