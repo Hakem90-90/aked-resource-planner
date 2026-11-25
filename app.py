@@ -16,34 +16,46 @@ st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 # Maximum number of project rows read from each Google Sheet
 MAX_ROWS = 50
 
-# ----- Teams: each team has its own Google Sheet and default number of engineers -----
+# ----- Teams: each team can read from multiple PM Google Sheets -----
 TEAMS = {
     "Tech Team": {
-        "sheet_id": "1RUqihUZreld3OY9M2cuPWtpxtuCS9p-2ut0FCFFwFvQ",
-        "gid": None,
+        "sources": [
+            {"pm": "Hatem", "sheet_id": "1uhTGZRXIpEo17xAafGAlvZQiozpfQpGuEdONTDqC07M", "gid": None},
+            {"pm": "M.Jamal", "sheet_id": "1Gi3OT0ckWjGLbGj1D6gLRjzJP3-3M7ufnSuW5XaTtiM", "gid": None},
+            {"pm": "ALI", "sheet_id": "1X_mO4jK3DWSnz-HBYX5bTL6w7VwpzGJqPSax8sJ6FtQ", "gid": None},
+            {"pm": "Hakem", "sheet_id": "1DGuOh10TsEbaGAukCVIvf7zhnzzTtb0sT5lghdOREZo", "gid": None},
+            {"pm": "Saed", "sheet_id": "1L7WGgEQlfVHnuBgJ9pcFN147-2iKOS4eAoZDXabMQw4", "gid": None},
+        ],
         "mode": "hours",
         "count_sheet": "team count",
         "count_gid": None,
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical", "QS"],
-        "engineers": [17, 12, 5, 6, 12, 4],  # Fallback defaults (عدل الرقم 4 للعدد الافتراضي لفريق QS)
+        "engineers": [17, 12, 5, 6, 12, 4],  # Fallback defaults
     },
     "Design Team": {
-        "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
-        "gid": None,
+        "sources": [
+            {"pm": "Hatem", "sheet_id": "1OLu-8F-rLzWQDBwBXY6hy7UdinAAmT9HudFjR4hwg-s", "gid": None},
+            {"pm": "M.Jamal", "sheet_id": "1EZhne868HwGFMhGctKMIpTS9q9Bu9uOxLK8HFAVcDJI", "gid": None},
+            {"pm": "ALI", "sheet_id": "1T-uTqRrj434npG_O2t_6H00ZdmB4RYHD-GqCma0mBFU", "gid": None},
+            {"pm": "Hakem", "sheet_id": "12kQT3spDilCM3cqapJhfeoxX7u7fuRqsLuqY5PGJDHM", "gid": None},
+            {"pm": "Saed", "sheet_id": "1JydBR9p0Ne-4d-8Ekx8XLGJ7veVygyRBjSZLaFXlrww", "gid": None},
+        ],
         "mode": "team_count",
         "disciplines": ["Arch Design Team"],
         "engineers": [21],
     },
     "BIM Team": {
-        "sheet_id": "1g9lFbLem738PcQ3FOWGjXZJopwWnf2g5-ncS6dUwNn8",
-        "gid": None,
+        "sources": [
+            {"pm": "All", "sheet_id": "1g9lFbLem738PcQ3FOWGjXZJopwWnf2g5-ncS6dUwNn8", "gid": None},
+        ],
         "mode": "team_count",
         "disciplines": ["BIM Team"],
         "engineers": [3],
     },
     "QC Team": {
-        "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc",
-        "gid": None,
+        "sources": [
+            {"pm": "All", "sheet_id": "1g0carFHs1RSN4MWtVFdt8kWfTnEmCFrMiicEznft8Bc", "gid": None},
+        ],
         "mode": "hours",
         "disciplines": ["Arch", "Structural", "MEP", "Electrical"],
         "engineers": [2, 1, 1, 2],
@@ -82,12 +94,13 @@ HOURS_PER_DAY = 8
 
 
 # ----------------------------------------------------------------------
-# 2. Load data from Google Sheet
+# 2. Load data from Google Sheet(s)
 # ----------------------------------------------------------------------
 def get_empty_template(mode="hours", disciplines=None):
     today = datetime.date.today()
     if mode == "team_count":
         return pd.DataFrame({
+            "Project Manager": ["Default"],
             "No.": [1],
             "Project Name": ["Example Project"],
             "Start Date": [today],
@@ -96,6 +109,7 @@ def get_empty_template(mode="hours", disciplines=None):
             "Calculated Hours": [160.0],
         })
     data = {
+        "Project Manager": ["Default"],
         "No.": [1],
         "Project Name": ["Example Project"],
         "Start Date": [today],
@@ -269,7 +283,6 @@ def load_from_gsheet(url, disciplines, max_rows=MAX_ROWS):
         disc_col_idx = None
         cnt_col_idx = None
 
-        # Only cut the table where a cell is EXACTLY "Discipline"
         for idx, row in raw_df.iterrows():
             for col_i, val in enumerate(row):
                 if pd.notnull(val) and str(val).strip().lower() == "discipline":
@@ -302,17 +315,76 @@ def load_from_gsheet(url, disciplines, max_rows=MAX_ROWS):
             df = raw_df.copy()
 
     df = df.dropna(how="all").reset_index(drop=True)
-
-    # ---- Keep only the first `max_rows` project rows ----
     df = df.head(max_rows).copy()
 
-    df["Start Date"] = parse_dates(df["Start Date"])
-    df["End Date"] = parse_dates(df["End Date"])
+    # Drop completely empty project rows (where Project Name is missing)
+    name_c = find_name_col(df)
+    if name_c and name_c in df.columns:
+        df = df[df[name_c].notna() & (df[name_c].astype(str).str.strip() != "")].reset_index(drop=True)
+
+    if "Start Date" in df.columns:
+        df["Start Date"] = parse_dates(df["Start Date"])
+    if "End Date" in df.columns:
+        df["End Date"] = parse_dates(df["End Date"])
+
     for c in df.columns:
         if c in DATA_COLS or "(hrs)" in c.lower() or "hours" in c.lower() or "count" in c.lower():
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df, eng_counts
+
+
+def load_team_merged_data(team_cfg, max_rows=MAX_ROWS):
+    """Load and merge all PM Google Sheets configured for a team."""
+    disciplines = team_cfg["disciplines"]
+    sources = team_cfg.get("sources", [])
+
+    dfs = []
+    merged_eng_counts = {}
+    errors = []
+
+    for src in sources:
+        pm_name = src.get("pm", "Unknown")
+        s_id = src["sheet_id"]
+        gid = src.get("gid")
+        csv_url = build_csv_url(s_id, gid)
+
+        try:
+            df_part, counts_part = load_from_gsheet(csv_url, disciplines, max_rows)
+
+            # Tag each row with its Project Manager if multiple PMs exist
+            if len(sources) > 1:
+                df_part.insert(0, "Project Manager", pm_name)
+
+            dfs.append(df_part)
+
+            if counts_part and not merged_eng_counts:
+                merged_eng_counts.update(counts_part)
+
+            if not merged_eng_counts and (team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None):
+                if team_cfg.get("count_gid") is not None:
+                    c_url = build_csv_url(s_id, team_cfg["count_gid"])
+                else:
+                    c_url = build_sheet_name_url(s_id, team_cfg["count_sheet"])
+                try:
+                    tab_c = load_team_counts(c_url, disciplines)
+                    if tab_c:
+                        merged_eng_counts.update(tab_c)
+                except Exception:
+                    pass
+        except Exception as e:
+            errors.append(f"{pm_name}: {e}")
+
+    if dfs:
+        combined_df = pd.concat(dfs, ignore_index=True, sort=False)
+        # Reorder standard columns nicely
+        front_cols = [c for c in ["Project Manager", "No.", "Project Name", "Start Date", "End Date"] if c in combined_df.columns]
+        other_cols = [c for c in combined_df.columns if c not in front_cols]
+        combined_df = combined_df[front_cols + other_cols]
+    else:
+        combined_df = get_empty_template(team_cfg["mode"], disciplines)
+
+    return combined_df, merged_eng_counts, errors
 
 
 # ----------------------------------------------------------------------
@@ -336,7 +408,7 @@ def find_calc_hrs_col(df):
 
 
 def find_name_col(df):
-    skip = {"No.", "Start Date", "End Date"} | set(DATA_COLS)
+    skip = {"Project Manager", "No.", "Start Date", "End Date"} | set(DATA_COLS)
     for c in df.columns:
         low = str(c).lower()
         if c not in skip and any(k in low for k in ("name", "project", "contract", "task")):
@@ -350,14 +422,17 @@ def find_name_col(df):
 def make_project_label(r, name_col):
     name = r.get(name_col) if name_col is not None else None
     name = str(name).strip() if pd.notnull(name) and str(name).strip() != "" else "Unnamed"
+    pm = r.get("Project Manager")
+    pm_prefix = f"[{pm}] " if pd.notnull(pm) and str(pm).strip() not in ("", "All", "Default") else ""
+
     no = r.get("No.")
     if pd.notnull(no) and str(no).strip() != "":
         try:
             no = int(float(no))
         except (ValueError, TypeError):
             pass
-        return f"{no}. {name}"
-    return name
+        return f"{pm_prefix}{no}. {name}"
+    return f"{pm_prefix}{name}"
 
 
 def prepare_calc_df(df, team_mode, disciplines, hours_per_day=HOURS_PER_DAY):
@@ -440,7 +515,6 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     hrs_cols = [f"{d} (Hrs)" for d in disciplines if f"{d} (Hrs)" in gantt_df.columns]
     gantt_df["Project"] = gantt_df.apply(lambda r: make_project_label(r, name_col), axis=1)
 
-    # Prevent Altair from merging projects with identical names onto the same row
     if gantt_df["Project"].duplicated().any():
         seen = {}
         unique_labels = []
@@ -476,24 +550,29 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
     x_scale = alt.Scale(domain=[x_min.isoformat(), x_max.isoformat()])
 
     extra_tooltips = []
+    if "Project Manager" in gantt_df.columns:
+        extra_tooltips.append(alt.Tooltip("Project Manager:N", title="Project Manager"))
     if team_mode == "team_count" and count_col is not None and count_col in gantt_df.columns:
         gantt_df["TeamCount"] = pd.to_numeric(gantt_df[count_col], errors="coerce")
         extra_tooltips.append(alt.Tooltip("TeamCount:Q", title="Team count"))
 
     tooltip_items = [
         alt.Tooltip("Project:N", title="Project"),
+        *extra_tooltips,
         alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
         alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
         alt.Tooltip("WorkDays:Q", title="Working days (Sun-Thu)"),
         alt.Tooltip("TotalHrs:Q", title="Total hours", format=",.0f"),
-        *extra_tooltips,
     ]
 
+    color_field = "Project Manager:N" if ("Project Manager" in gantt_df.columns and gantt_df["Project Manager"].nunique() > 1) else "Project:N"
+    show_legend = alt.Legend(title="Project Manager") if color_field == "Project Manager:N" else None
+
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
-        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=250)),
+        y=alt.Y("Project:N", sort=project_order, title=None, axis=alt.Axis(labelLimit=280)),
         x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
-        color=alt.Color("Project:N", legend=None),
+        color=alt.Color(color_field, legend=show_legend),
         tooltip=tooltip_items,
     )
 
@@ -537,10 +616,23 @@ def render_project_gantt_chart(calc_df, disciplines, team_mode, count_col, hide_
 def render_main_overview():
     st.subheader("🗓️ Project Timelines - Main Overview (All Teams)")
 
-    col_f1, col_f2 = st.columns([2, 2])
+    col_f1, col_f2, col_f3 = st.columns([1.5, 2, 1.5])
     with col_f1:
         hide_comp = st.checkbox("Filter completed", value=False, key="main_hide_comp")
     with col_f2:
+        all_pms = sorted({
+            src["pm"]
+            for cfg in TEAMS.values()
+            for src in cfg.get("sources", [])
+            if src["pm"] != "All"
+        })
+        selected_pms = st.multiselect(
+            "👔 Filter by Project Manager:",
+            options=all_pms,
+            default=all_pms,
+            key="main_pm_filter",
+        )
+    with col_f3:
         if st.button("🔄 Refresh All Sheets", use_container_width=True):
             load_from_gsheet.clear()
             load_team_counts.clear()
@@ -560,8 +652,12 @@ def render_main_overview():
                 cfg = TEAMS[t_name]
                 st.markdown(f"### 👥 {t_name}")
                 try:
-                    csv_url = build_csv_url(cfg["sheet_id"], cfg["gid"])
-                    team_df, team_counts = load_from_gsheet(csv_url, cfg["disciplines"], MAX_ROWS)
+                    team_df, team_counts, errs = load_team_merged_data(cfg, MAX_ROWS)
+                    if errs:
+                        st.warning(f"Partial load warnings: {'; '.join(errs)}")
+
+                    if "Project Manager" in team_df.columns and selected_pms:
+                        team_df = team_df[team_df["Project Manager"].isin(selected_pms + ["All", "Default"])]
 
                     team_calc_df, t_count_col = prepare_calc_df(team_df, cfg["mode"], cfg["disciplines"])
                     render_project_gantt_chart(team_calc_df, cfg["disciplines"], cfg["mode"], t_count_col, hide_comp)
@@ -578,6 +674,7 @@ def render_main_overview():
                             if e_date and e_date < today:
                                 p_label = make_project_label(r, name_col)
                                 all_completed_projects.append({
+                                    "Project Manager": r.get("Project Manager", "-"),
                                     "Project Name": p_label,
                                     "End Date": e_date,
                                     "Department": t_name,
@@ -615,7 +712,7 @@ def render_main_overview():
 
         if start_date_filter > end_date_filter:
             st.warning("⚠️ Start Date must be before or equal to End Date.")
-            filtered_comp = pd.DataFrame(columns=["Project Name", "End Date", "Department"])
+            filtered_comp = pd.DataFrame(columns=["Project Manager", "Project Name", "End Date", "Department"])
         else:
             mask = (
                 (comp_df["Department"].isin(selected_teams)) &
@@ -643,14 +740,14 @@ def render_main_overview():
                 st.info("No completed projects match the selected filter criteria.")
             else:
                 st.dataframe(
-                    filtered_comp[["Project Name", "End Date", "Department"]],
+                    filtered_comp[["Project Manager", "Project Name", "End Date", "Department"]],
                     use_container_width=True,
                     hide_index=True
                 )
 
         for idx, t in enumerate(selected_teams):
             with comp_tabs[idx + 1]:
-                t_sub = filtered_comp[filtered_comp["Department"] == t][["Project Name", "End Date"]]
+                t_sub = filtered_comp[filtered_comp["Department"] == t][["Project Manager", "Project Name", "End Date"]]
                 if t_sub.empty:
                     st.info(f"No completed projects for {t} within the selected date range.")
                 else:
@@ -671,38 +768,31 @@ if selected_team == MAIN_OPTION:
 team_cfg = TEAMS[selected_team]
 team_mode = team_cfg["mode"]
 disciplines = team_cfg["disciplines"]
-SHEET_ID = team_cfg["sheet_id"]
-CSV_URL = build_csv_url(SHEET_ID, team_cfg["gid"])
+sources = team_cfg["sources"]
 
 # ----------------------------------------------------------------------
-# 2e. Live Data Loading
+# 2e. Live Data Loading (Merged across PMs)
 # ----------------------------------------------------------------------
 st.markdown("---")
 
-live_projects = None
-live_eng_counts = {}
-try:
-    live_projects, live_eng_counts = load_from_gsheet(CSV_URL, disciplines, MAX_ROWS)
-    if team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None:
-        if team_cfg.get("count_gid") is not None:
-            c_url = build_csv_url(SHEET_ID, team_cfg["count_gid"])
-        else:
-            c_url = build_sheet_name_url(SHEET_ID, team_cfg["count_sheet"])
-        try:
-            tab_c = load_team_counts(c_url, disciplines)
-            if tab_c:
-                live_eng_counts = tab_c
-        except Exception:
-            pass
-except Exception as e:
-    st.error(f"Could not read the {selected_team} Google Sheet ({e}). Using empty template.")
-    live_projects = get_empty_template(team_mode, disciplines)
+live_projects, live_eng_counts, load_errors = load_team_merged_data(team_cfg, MAX_ROWS)
 
-c_btn1, c_btn2, _ = st.columns([1, 1.4, 3.6])
-with c_btn1:
-    refresh_clicked = st.button("🔄 Refresh Sheet", use_container_width=True)
-with c_btn2:
-    st.link_button("🔗 Open Google Sheet", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", use_container_width=True)
+if load_errors:
+    st.warning(f"⚠️ Could not read some sheets for {selected_team}: {'; '.join(load_errors)}")
+
+# Refresh & Direct Sheet Links
+btn_cols = st.columns([1.2] + [1] * len(sources))
+with btn_cols[0]:
+    refresh_clicked = st.button("🔄 Refresh Sheets", use_container_width=True)
+
+for idx, src in enumerate(sources):
+    with btn_cols[idx + 1]:
+        btn_label = f"🔗 {src['pm']}" if len(sources) > 1 else "🔗 Open Google Sheet"
+        st.link_button(
+            btn_label,
+            f"https://docs.google.com/spreadsheets/d/{src['sheet_id']}/edit",
+            use_container_width=True,
+        )
 
 if refresh_clicked:
     load_from_gsheet.clear()
@@ -711,11 +801,25 @@ if refresh_clicked:
         st.session_state.pop(f"eng_{selected_team}_{d}", None)
     st.rerun()
 
-df_projects = live_projects if live_projects is not None else get_empty_template(team_mode, disciplines)
+df_projects = live_projects
 sheet_eng_counts = live_eng_counts
 counts_source = "Live Google Sheet"
-st.success(f"🟢 **{selected_team}**: Viewing Live Data from Google Sheet "
-           f"(first {MAX_ROWS} rows read — {len(df_projects)} rows loaded).")
+
+# Optional PM filter inside the team view
+if "Project Manager" in df_projects.columns and df_projects["Project Manager"].nunique() > 1:
+    pm_options = sorted(df_projects["Project Manager"].dropna().unique().tolist())
+    chosen_pms = st.multiselect(
+        "👔 Filter by Project Manager:",
+        options=pm_options,
+        default=pm_options,
+        key=f"pm_filter_{selected_team}",
+    )
+    df_projects = df_projects[df_projects["Project Manager"].isin(chosen_pms)].reset_index(drop=True)
+
+st.success(
+    f"🟢 **{selected_team}**: Merged Live Data from {len(sources)} sheet(s) "
+    f"— {len(df_projects)} project rows loaded."
+)
 
 # ----------------------------------------------------------------------
 # 3. Sidebar - Capacity Settings
