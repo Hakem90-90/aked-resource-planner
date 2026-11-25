@@ -24,8 +24,8 @@ TEAMS = {
         "mode": "hours",
         "count_sheet": "team count",
         "count_gid": None,
-        "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"],
-        "engineers": [17, 12, 5, 6, 12],  # Fallback defaults (Total = 52)
+        "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical", "QS"],
+        "engineers": [17, 12, 5, 6, 12, 4],  # Fallback defaults (عدل الرقم 4 للعدد الافتراضي لفريق QS)
     },
     "Design Team": {
         "sheet_id": "15AR4hB_q1JZ1SIwegy2ieusDkPQAMSXFG5uG7Y2zaFg",
@@ -101,7 +101,7 @@ def get_empty_template(mode="hours", disciplines=None):
         "Start Date": [today],
         "End Date": [today + datetime.timedelta(days=30)],
     }
-    for d in (disciplines or ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical"]):
+    for d in (disciplines or ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical", "QS"]):
         data[f"{d} (Hrs)"] = [40.0]
     return pd.DataFrame(data)
 
@@ -135,6 +135,8 @@ def match_discipline_name(raw_name, disciplines):
         if ("mech" in raw_low or "mep" in raw_low) and ("mep" in d_low or "mech" in d_low):
             return d
         if "elec" in raw_low and "elec" in d_low:
+            return d
+        if ("qs" in raw_low or "quantity" in raw_low) and "qs" in d_low:
             return d
     return None
 
