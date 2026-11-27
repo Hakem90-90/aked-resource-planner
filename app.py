@@ -17,6 +17,12 @@ st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 # Maximum number of project rows read from each Google Sheet
 MAX_ROWS = 50
 
+# Single source of truth for Tech / Actual Team headcount (Hakem's "Team count" tab)
+HAKEM_HEADCOUNT_SOURCE = {
+    "sheet_id": "1DGuOh10TsEbaGAukCVIvf7zhnzzTtb0sT5lghdOREZo",
+    "gid": 188228010,
+}
+
 # ----- Teams: each team can read from multiple PM Google Sheets -----
 TEAMS = {
     "Tech Team": {
@@ -28,10 +34,9 @@ TEAMS = {
             {"pm": "Saed", "sheet_id": "1L7WGgEQlfVHnuBgJ9pcFN147-2iKOS4eAoZDXabMQw4", "gid": None},
         ],
         "mode": "hours",
-        "count_sheet": "team count",
-        "count_gid": None,
+        "count_source": HAKEM_HEADCOUNT_SOURCE,
         "disciplines": ["Arch Tech", "Structural", "Plumbing", "HVAC", "Electrical", "QS"],
-        "engineers": [17, 12, 5, 6, 12, 4],  # Fallback defaults
+        "engineers": [13, 16, 5, 5, 11, 2],  # Fallback defaults matching Hakem's sheet
     },
     "Design Team": {
         "sources": [
@@ -70,13 +75,13 @@ ACTUAL_TEAM_SOURCES = {
         "label_ar": "فريق الكهرباء",
         "sheet_id": "1wuUdghyxxDJqNk-oTC26X3CHpWRX6TiuMctDc4j87YM",
         "gid": 0,
-        "fallback_engineers": 12,
+        "fallback_engineers": 11,
     },
     "HVAC": {
         "label_ar": "فريق الـ HVAC",
         "sheet_id": "1pvQ4vIiax5UiJPrysV4ADtuiiqDITf89pQKwx1n94TU",
         "gid": 0,
-        "fallback_engineers": 6,
+        "fallback_engineers": 5,
     },
     "Plumbing": {
         "label_ar": "فريق Plumbing",
@@ -88,13 +93,13 @@ ACTUAL_TEAM_SOURCES = {
         "label_ar": "فريق المعماري تيكنيكال",
         "sheet_id": "1DsPBL8RqaK5MG1TJfAFIa-sTs925YGEJbHu-JjukDGw",
         "gid": 0,
-        "fallback_engineers": 17,
+        "fallback_engineers": 13,
     },
     "Structural": {
         "label_ar": "فريق الإنشائي",
         "sheet_id": "183zQfKqhcRJAkulTMx47JoNHempE9gshuMseQGVVgLM",
         "gid": 0,
-        "fallback_engineers": 12,
+        "fallback_engineers": 16,
     },
 }
 
@@ -379,6 +384,17 @@ def load_team_merged_data(team_cfg, max_rows=MAX_ROWS):
     merged_eng_counts = {}
     errors = []
 
+    # If a dedicated headcount source (e.g. Hakem's Team count tab) is configured, read from it exclusively
+    dedicated_count_src = team_cfg.get("count_source")
+    if dedicated_count_src:
+        c_url = build_csv_url(dedicated_count_src["sheet_id"], dedicated_count_src.get("gid"))
+        try:
+            tab_c = load_team_counts(c_url, disciplines)
+            if tab_c:
+                merged_eng_counts.update(tab_c)
+        except Exception as e:
+            errors.append(f"Headcount tab: {e}")
+
     for src in sources:
         pm_name = src.get("pm", "Unknown")
         s_id = src["sheet_id"]
@@ -394,20 +410,21 @@ def load_team_merged_data(team_cfg, max_rows=MAX_ROWS):
 
             dfs.append(df_part)
 
-            if counts_part and not merged_eng_counts:
-                merged_eng_counts.update(counts_part)
+            if not dedicated_count_src:
+                if counts_part and not merged_eng_counts:
+                    merged_eng_counts.update(counts_part)
 
-            if not merged_eng_counts and (team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None):
-                if team_cfg.get("count_gid") is not None:
-                    c_url = build_csv_url(s_id, team_cfg["count_gid"])
-                else:
-                    c_url = build_sheet_name_url(s_id, team_cfg["count_sheet"])
-                try:
-                    tab_c = load_team_counts(c_url, disciplines)
-                    if tab_c:
-                        merged_eng_counts.update(tab_c)
-                except Exception:
-                    pass
+                if not merged_eng_counts and (team_cfg.get("count_sheet") or team_cfg.get("count_gid") is not None):
+                    if team_cfg.get("count_gid") is not None:
+                        c_url = build_csv_url(s_id, team_cfg["count_gid"])
+                    else:
+                        c_url = build_sheet_name_url(s_id, team_cfg["count_sheet"])
+                    try:
+                        tab_c = load_team_counts(c_url, disciplines)
+                        if tab_c:
+                            merged_eng_counts.update(tab_c)
+                    except Exception:
+                        pass
         except Exception as e:
             errors.append(f"{pm_name}: {e}")
 
@@ -556,25 +573,17 @@ def load_actual_team_sheet(url, discipline_name):
 
 
 def get_program_discipline_counts():
-    """Fetch live engineer counts from Tech Team's 'team count' tab with fallback defaults."""
-    tech_cfg = TEAMS["Tech Team"]
+    """Fetch live engineer counts exclusively from Hakem's Tech Team 'Team count' tab."""
     disciplines = list(ACTUAL_TEAM_SOURCES.keys())
     counts = {}
 
-    for src in tech_cfg.get("sources", []):
-        s_id = src["sheet_id"]
-        c_url = (
-            build_csv_url(s_id, tech_cfg["count_gid"])
-            if tech_cfg.get("count_gid") is not None
-            else build_sheet_name_url(s_id, tech_cfg.get("count_sheet", "team count"))
-        )
-        try:
-            tab_c = load_team_counts(c_url, disciplines)
-            if tab_c:
-                counts.update(tab_c)
-                break
-        except Exception:
-            continue
+    c_url = build_csv_url(HAKEM_HEADCOUNT_SOURCE["sheet_id"], HAKEM_HEADCOUNT_SOURCE["gid"])
+    try:
+        tab_c = load_team_counts(c_url, disciplines)
+        if tab_c:
+            counts.update(tab_c)
+    except Exception:
+        pass
 
     # Fill any missing discipline with fallback
     for d, cfg in ACTUAL_TEAM_SOURCES.items():
@@ -668,10 +677,15 @@ def render_actual_team_view():
         st.error("No Actual Team sheets could be loaded.")
         return
 
-    # Sidebar: Program Engineers Count (pulled live from Tech Team count sheet, editable)
+    # Sidebar: Program Engineers Count (pulled exclusively from Hakem's Tech Team 'Team count' tab)
     program_defaults = get_program_discipline_counts()
     st.sidebar.header("⚙️ Actual Team Headcount")
-    st.sidebar.caption("Synced with Tech Team count sheet (editable for simulation):")
+    st.sidebar.caption("Source: Hakem — Tech Team (Team count tab)")
+    st.sidebar.link_button(
+        "🔗 Open Hakem Headcount Tab",
+        f"https://docs.google.com/spreadsheets/d/{HAKEM_HEADCOUNT_SOURCE['sheet_id']}/edit?gid={HAKEM_HEADCOUNT_SOURCE['gid']}#gid={HAKEM_HEADCOUNT_SOURCE['gid']}",
+        use_container_width=True,
+    )
 
     total_engineers_map = {}
     for disc in disc_list:
@@ -1451,7 +1465,7 @@ if refresh_clicked:
 
 df_projects = live_projects
 sheet_eng_counts = live_eng_counts
-counts_source = "Live Google Sheet"
+counts_source = "Hakem's Tech Team (Team count tab)" if team_cfg.get("count_source") else "Live Google Sheet"
 
 # Optional PM filter inside the team view
 if "Project Manager" in df_projects.columns and df_projects["Project Manager"].nunique() > 1:
