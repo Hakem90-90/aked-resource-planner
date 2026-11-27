@@ -1,4 +1,5 @@
 import datetime
+import re
 from urllib.parse import quote
 
 import streamlit as st
@@ -62,6 +63,41 @@ TEAMS = {
     },
 }
 
+# ----- Actual Team Tracking Sheets (by Discipline) -----
+ACTUAL_TEAM_OPTION = "Actual Team"
+ACTUAL_TEAM_SOURCES = {
+    "Electrical": {
+        "label_ar": "فريق الكهرباء",
+        "sheet_id": "1wuUdghyxxDJqNk-oTC26X3CHpWRX6TiuMctDc4j87YM",
+        "gid": 0,
+        "fallback_engineers": 12,
+    },
+    "HVAC": {
+        "label_ar": "فريق الـ HVAC",
+        "sheet_id": "1pvQ4vIiax5UiJPrysV4ADtuiiqDITf89pQKwx1n94TU",
+        "gid": 0,
+        "fallback_engineers": 6,
+    },
+    "Plumbing": {
+        "label_ar": "فريق Plumbing",
+        "sheet_id": "1RzMbLSaSXm4CiIQxk65bPlLqdEvQ-zduSZWfX6CLErk",
+        "gid": 0,
+        "fallback_engineers": 5,
+    },
+    "Arch Tech": {
+        "label_ar": "فريق المعماري تيكنيكال",
+        "sheet_id": "1DsPBL8RqaK5MG1TJfAFIa-sTs925YGEJbHu-JjukDGw",
+        "gid": 0,
+        "fallback_engineers": 17,
+    },
+    "Structural": {
+        "label_ar": "فريق الإنشائي",
+        "sheet_id": "183zQfKqhcRJAkulTMx47JoNHempE9gshuMseQGVVgLM",
+        "gid": 0,
+        "fallback_engineers": 12,
+    },
+}
+
 MAIN_OPTION = "Main"
 
 
@@ -120,12 +156,12 @@ def get_empty_template(mode="hours", disciplines=None):
     return pd.DataFrame(data)
 
 
-def parse_dates(series):
-    """Parse mixed date formats safely (e.g. 2026-10-18 and 11/1/2026)."""
+def parse_dates(series, dayfirst=False):
+    """Parse mixed date formats safely (e.g. 2026-10-18, 11/1/2026, or 15/11/2026)."""
     try:
-        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=dayfirst)
     except (TypeError, ValueError):
-        parsed = pd.to_datetime(series, errors="coerce")
+        parsed = pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
     return parsed.dt.date
 
 
@@ -385,6 +421,602 @@ def load_team_merged_data(team_cfg, max_rows=MAX_ROWS):
         combined_df = get_empty_template(team_cfg["mode"], disciplines)
 
     return combined_df, merged_eng_counts, errors
+
+
+# ----------------------------------------------------------------------
+# 2b. Actual Team Data Loading & Resource Analysis Helpers
+# ----------------------------------------------------------------------
+def split_engineer_names(raw_val):
+    """Split a cell containing engineer names separated by '-', '/', ',', or '،'."""
+    if pd.isnull(raw_val):
+        return []
+    text = str(raw_val).strip()
+    if not text or re.fullmatch(r"[-–—_\s]+", text):
+        return []
+    parts = re.split(r"\s*[-–—/,،&+]+\s*", text)
+    cleaned = []
+    for p in parts:
+        name = re.sub(r"\s+", " ", p).strip()
+        if name and len(name) > 1:
+            cleaned.append(name)
+    return cleaned
+
+
+def _parse_actual_date_cell(val):
+    """Parse DD/MM/YYYY dates safely; return None for blank or '-----'."""
+    if pd.isnull(val):
+        return None
+    txt = str(val).strip()
+    if not txt or re.fullmatch(r"[-–—_\s]+", txt):
+        return None
+    ts = pd.to_datetime(txt, errors="coerce", dayfirst=True)
+    if pd.isnull(ts):
+        return None
+    return ts.date()
+
+
+@st.cache_data(ttl=60, show_spinner="Loading Actual Team tracking sheet...")
+def load_actual_team_sheet(url, discipline_name):
+    """Read an Arabic Actual Team resource sheet (skipping merged title rows automatically)."""
+    raw = pd.read_csv(url, header=None, dtype=str)
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "Discipline", "Unit Head", "Engineers", "Project", "Task",
+            "Engineers Count", "Start Date", "End Date", "Is Ongoing", "Engineer List"
+        ])
+
+    # Detect header row dynamically (look for المشروع / المهندس / عدد المهندسين)
+    header_idx = None
+    for idx, row in raw.iterrows():
+        row_joined = " ".join(str(x).strip().lower() for x in row if pd.notnull(x))
+        if any(k in row_joined for k in ("المشروع", "المهندس", "عدد المهندسين", "تاريخ البدء", "project", "engineer")):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        header_idx = 0
+
+    headers = [str(x).strip() if pd.notnull(x) else "" for x in raw.iloc[header_idx]]
+    body = raw.iloc[header_idx + 1:].copy().reset_index(drop=True)
+
+    # Map column indices flexibly
+    col_map = {
+        "unit_head": None,
+        "engineers": None,
+        "project": None,
+        "task": None,
+        "count": None,
+        "start": None,
+        "end": None,
+    }
+    for i, h in enumerate(headers):
+        h_low = h.lower()
+        if "unit" in h_low or "head" in h_low or "رئيس" in h_low:
+            col_map["unit_head"] = i
+        elif "عدد" in h_low or "count" in h_low:
+            col_map["count"] = i
+        elif "مهندس" in h_low or "engineer" in h_low:
+            col_map["engineers"] = i
+        elif "مشروع" in h_low or "project" in h_low:
+            col_map["project"] = i
+        elif "مهم" in h_low or "task" in h_low:
+            col_map["task"] = i
+        elif "بدء" in h_low or "بداي" in h_low or "start" in h_low:
+            col_map["start"] = i
+        elif "نهاي" in h_low or "انته" in h_low or "end" in h_low:
+            col_map["end"] = i
+
+    records = []
+    for _, r in body.iterrows():
+        def _get(key):
+            c_idx = col_map[key]
+            if c_idx is None or c_idx >= len(r):
+                return ""
+            v = r.iloc[c_idx]
+            return "" if pd.isnull(v) else str(v).strip()
+
+        unit_head = _get("unit_head")
+        eng_str = _get("engineers")
+        project = _get("project")
+        task = _get("task")
+        cnt_raw = _get("count")
+        start_raw = _get("start")
+        end_raw = _get("end")
+
+        # Skip completely empty rows
+        if not any([eng_str, project, task, start_raw, end_raw]):
+            continue
+
+        eng_list = split_engineer_names(eng_str)
+
+        try:
+            eng_count = int(float(cnt_raw)) if cnt_raw != "" else len(eng_list)
+        except (ValueError, TypeError):
+            eng_count = len(eng_list)
+
+        s_date = _parse_actual_date_cell(start_raw)
+        e_date = _parse_actual_date_cell(end_raw)
+        # Ongoing if Start Date exists but End Date is blank or '-----'
+        is_ongoing = (s_date is not None) and (e_date is None)
+
+        records.append({
+            "Discipline": discipline_name,
+            "Unit Head": unit_head if unit_head else "-",
+            "Engineers": eng_str if eng_str else "-",
+            "Project": project if project else "-",
+            "Task": task if task else "-",
+            "Engineers Count": max(0, eng_count),
+            "Start Date": s_date,
+            "End Date": e_date,
+            "Is Ongoing": is_ongoing,
+            "Engineer List": eng_list,
+        })
+
+    return pd.DataFrame(records)
+
+
+def get_program_discipline_counts():
+    """Fetch live engineer counts from Tech Team's 'team count' tab with fallback defaults."""
+    tech_cfg = TEAMS["Tech Team"]
+    disciplines = list(ACTUAL_TEAM_SOURCES.keys())
+    counts = {}
+
+    for src in tech_cfg.get("sources", []):
+        s_id = src["sheet_id"]
+        c_url = (
+            build_csv_url(s_id, tech_cfg["count_gid"])
+            if tech_cfg.get("count_gid") is not None
+            else build_sheet_name_url(s_id, tech_cfg.get("count_sheet", "team count"))
+        )
+        try:
+            tab_c = load_team_counts(c_url, disciplines)
+            if tab_c:
+                counts.update(tab_c)
+                break
+        except Exception:
+            continue
+
+    # Fill any missing discipline with fallback
+    for d, cfg in ACTUAL_TEAM_SOURCES.items():
+        if d not in counts:
+            counts[d] = cfg["fallback_engineers"]
+    return counts
+
+
+def classify_actual_task(row, ref_date, soon_days):
+    """Classify task status relative to ref_date."""
+    s_date = row["Start Date"]
+    e_date = row["End Date"]
+    is_ongoing = row["Is Ongoing"]
+
+    if s_date is None and e_date is None:
+        return "⚪ No Dates", None
+
+    if is_ongoing:
+        if s_date <= ref_date:
+            return "♾️ Ongoing (No End Date)", None
+        return "🔵 Upcoming", None
+
+    if s_date is not None and s_date > ref_date:
+        return "🔵 Upcoming", (e_date - ref_date).days if e_date else None
+
+    if e_date is not None and e_date < ref_date:
+        return "⚪ Completed", (e_date - ref_date).days
+
+    # Active on ref_date
+    days_left = (e_date - ref_date).days if e_date is not None else None
+    if days_left is not None and 0 <= days_left <= soon_days:
+        return "⏳ Ending Soon", days_left
+    return "🟢 Active", days_left
+
+
+def is_task_active_on_date(row, check_date):
+    s_date = row["Start Date"]
+    e_date = row["End Date"]
+    if s_date is None:
+        return False
+    if row["Is Ongoing"]:
+        return s_date <= check_date
+    if e_date is None:
+        return False
+    return s_date <= check_date <= e_date
+
+
+def render_actual_team_view():
+    st.markdown("---")
+    st.subheader("👷 Actual Team — Live Resource Allocation & Availability Tracker")
+
+    # Refresh & Direct Links to all 5 sheets
+    disc_list = list(ACTUAL_TEAM_SOURCES.keys())
+    btn_cols = st.columns([1.2] + [1] * len(disc_list))
+    with btn_cols[0]:
+        refresh_actual = st.button("🔄 Refresh All 5 Sheets", use_container_width=True, key="refresh_actual_btn")
+
+    for idx, disc in enumerate(disc_list):
+        cfg = ACTUAL_TEAM_SOURCES[disc]
+        with btn_cols[idx + 1]:
+            st.link_button(
+                f"🔗 {disc}",
+                f"https://docs.google.com/spreadsheets/d/{cfg['sheet_id']}/edit?gid={cfg['gid']}#gid={cfg['gid']}",
+                use_container_width=True,
+            )
+
+    if refresh_actual:
+        load_actual_team_sheet.clear()
+        load_team_counts.clear()
+        for d in disc_list:
+            st.session_state.pop(f"actual_total_eng_{d}", None)
+        st.rerun()
+
+    # Load all 5 sheets
+    all_dfs = []
+    load_errors = []
+    for disc, cfg in ACTUAL_TEAM_SOURCES.items():
+        url = build_csv_url(cfg["sheet_id"], cfg["gid"])
+        try:
+            df_d = load_actual_team_sheet(url, disc)
+            all_dfs.append(df_d)
+        except Exception as e:
+            load_errors.append(f"{disc}: {e}")
+
+    if load_errors:
+        st.warning(f"⚠️ Could not load some sheets: {'; '.join(load_errors)}")
+
+    if all_dfs:
+        actual_df = pd.concat(all_dfs, ignore_index=True)
+    else:
+        st.error("No Actual Team sheets could be loaded.")
+        return
+
+    # Sidebar: Program Engineers Count (pulled live from Tech Team count sheet, editable)
+    program_defaults = get_program_discipline_counts()
+    st.sidebar.header("⚙️ Actual Team Headcount")
+    st.sidebar.caption("Synced with Tech Team count sheet (editable for simulation):")
+
+    total_engineers_map = {}
+    for disc in disc_list:
+        total_engineers_map[disc] = st.sidebar.number_input(
+            f"{disc} Total Engineers",
+            min_value=0,
+            value=int(program_defaults.get(disc, ACTUAL_TEAM_SOURCES[disc]["fallback_engineers"])),
+            key=f"actual_total_eng_{disc}",
+        )
+    st.sidebar.markdown("---")
+    st.sidebar.metric("👥 Total Engineers (All 5 Disciplines)", sum(total_engineers_map.values()))
+
+    # Top Filter Controls
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.5, 1.5])
+    with c1:
+        ref_date = st.date_input("📅 Reference Date (Check Availability):", value=datetime.date.today(), key="actual_ref_date")
+    with c2:
+        soon_days = st.slider("⏳ 'Free Soon' Window (Days):", min_value=1, max_value=30, value=7, key="actual_soon_days")
+    with c3:
+        selected_discs = st.multiselect(
+            "🏗️ Disciplines:",
+            options=disc_list,
+            default=disc_list,
+            key="actual_disc_filter",
+        )
+    with c4:
+        calc_basis = st.radio(
+            "🧮 Busy Count Basis:",
+            options=["By 'عدد المهندسين' Column", "By Unique Engineer Names"],
+            horizontal=True,
+            key="actual_calc_basis",
+            help="Use 'عدد المهندسين' for total task load, or 'Unique Engineer Names' when one engineer works on multiple projects simultaneously.",
+        )
+
+    if not selected_discs:
+        st.info("Please select at least one discipline.")
+        return
+
+    work_df = actual_df[actual_df["Discipline"].isin(selected_discs)].copy()
+
+    # Classify each task relative to ref_date
+    statuses = []
+    days_left_list = []
+    active_flags = []
+    for _, r in work_df.iterrows():
+        status_lbl, d_left = classify_actual_task(r, ref_date, soon_days)
+        statuses.append(status_lbl)
+        days_left_list.append(d_left)
+        active_flags.append(is_task_active_on_date(r, ref_date))
+
+    work_df["Status"] = statuses
+    work_df["Days Left"] = days_left_list
+    work_df["Is Active"] = active_flags
+
+    # ------------------------------------------------------------------
+    # Section 1: Summary by Discipline (Working vs. Free Engineers)
+    # ------------------------------------------------------------------
+    summary_rows = []
+    for disc in selected_discs:
+        d_sub = work_df[work_df["Discipline"] == disc]
+        active_sub = d_sub[d_sub["Is Active"]]
+        soon_sub = d_sub[d_sub["Status"] == "⏳ Ending Soon"]
+
+        total_in_prog = total_engineers_map[disc]
+        assigned_sum = int(active_sub["Engineers Count"].sum()) if not active_sub.empty else 0
+
+        unique_active_names = sorted({
+            name for names in active_sub["Engineer List"] for name in names
+        })
+        unique_active_count = len(unique_active_names)
+
+        working_used = assigned_sum if calc_basis == "By 'عدد المهندسين' Column" else unique_active_count
+        free_count = total_in_prog - working_used
+
+        soon_eng_sum = int(soon_sub["Engineers Count"].sum()) if not soon_sub.empty else 0
+
+        if free_count > 0:
+            status_badge = f"🟢 {free_count} Free"
+        elif free_count == 0:
+            status_badge = "🟡 Fully Utilized"
+        else:
+            status_badge = f"🔴 Overloaded ({free_count})"
+
+        summary_rows.append({
+            "Discipline": disc,
+            "Total in Program": total_in_prog,
+            "Active Tasks": len(active_sub),
+            "Working (عدد المهندسين)": assigned_sum,
+            "Unique Names Active": unique_active_count,
+            "Free / Available": free_count,
+            f"Ending in ≤{soon_days}d (Tasks)": len(soon_sub),
+            f"Freeing Up Soon (Eng)": soon_eng_sum,
+            "Status": status_badge,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    total_prog_all = int(summary_df["Total in Program"].sum())
+    total_working_all = int(
+        summary_df["Working (عدد المهندسين)"].sum()
+        if calc_basis == "By 'عدد المهندسين' Column"
+        else summary_df["Unique Names Active"].sum()
+    )
+    total_free_all = total_prog_all - total_working_all
+    total_soon_tasks = int(summary_df[f"Ending in ≤{soon_days}d (Tasks)"].sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("👥 Total Engineers (Program)", total_prog_all)
+    k2.metric("🛠️ Working on Projects", total_working_all)
+    k3.metric("🟢 Free / Available Now", total_free_all)
+    k4.metric(f"⏳ Tasks Ending Within {soon_days} Days", total_soon_tasks)
+
+    st.markdown("### 📊 Availability Summary by Discipline")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    # Bar chart: Working vs Available per discipline
+    chart_rows = []
+    for _, r in summary_df.iterrows():
+        working_val = r["Working (عدد المهندسين)"] if calc_basis == "By 'عدد المهندسين' Column" else r["Unique Names Active"]
+        free_val = max(0, r["Free / Available"])
+        overload_val = max(0, -r["Free / Available"])
+        chart_rows.append({"Discipline": r["Discipline"], "Category": "Working (Assigned)", "Engineers": min(working_val, r["Total in Program"])})
+        if free_val > 0:
+            chart_rows.append({"Discipline": r["Discipline"], "Category": "Free / Available", "Engineers": free_val})
+        if overload_val > 0:
+            chart_rows.append({"Discipline": r["Discipline"], "Category": "Overloaded (Multi-Task)", "Engineers": overload_val})
+
+    avail_chart_df = pd.DataFrame(chart_rows)
+    if not avail_chart_df.empty:
+        color_scale = alt.Scale(
+            domain=["Working (Assigned)", "Free / Available", "Overloaded (Multi-Task)"],
+            range=["#1f77b4", "#2ca02c", "#d62728"],
+        )
+        bar_chart = alt.Chart(avail_chart_df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+            x=alt.X("Discipline:N", title="Discipline", axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Engineers:Q", title="Number of Engineers"),
+            color=alt.Color("Category:N", scale=color_scale, legend=alt.Legend(title="Status")),
+            tooltip=["Discipline", "Category", "Engineers"],
+        ).properties(height=300)
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # Section 2: Who Is Free Now & Who Will Be Free Soon
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown(f"### ⏳ Freeing Up Soon (Ending Within {soon_days} Days)")
+        soon_df = work_df[work_df["Status"] == "⏳ Ending Soon"].sort_values("End Date")
+        if soon_df.empty:
+            st.info(f"No active tasks ending within {soon_days} days of {ref_date}.")
+        else:
+            st.dataframe(
+                soon_df[["Discipline", "Engineers", "Project", "Task", "Engineers Count", "End Date", "Days Left"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with col_right:
+        st.markdown("### 🟢 Engineers Currently Without Active Tasks")
+        st.caption("Engineers listed in the sheets whose tasks ended before the reference date (or haven't started yet).")
+
+        free_eng_records = []
+        for disc in selected_discs:
+            d_sub = work_df[work_df["Discipline"] == disc]
+            all_known_names = sorted({n for lst in d_sub["Engineer List"] for n in lst})
+            active_names = {n for lst in d_sub[d_sub["Is Active"]]["Engineer List"] for n in lst}
+
+            upcoming_sub = d_sub[d_sub["Status"] == "🔵 Upcoming"]
+            completed_sub = d_sub[d_sub["Status"] == "⚪ Completed"]
+
+            for name in all_known_names:
+                if name not in active_names:
+                    # Check if they have an upcoming task
+                    next_tasks = upcoming_sub[upcoming_sub["Engineer List"].apply(lambda lst: name in lst)].sort_values("Start Date")
+                    if not next_tasks.empty:
+                        nxt = next_tasks.iloc[0]
+                        next_info = f"Booked: {nxt['Project']} (starts {nxt['Start Date']})"
+                    else:
+                        next_info = "No upcoming task scheduled"
+
+                    # Last completed task
+                    prev_tasks = completed_sub[completed_sub["Engineer List"].apply(lambda lst: name in lst)].sort_values("End Date", ascending=False)
+                    last_proj = prev_tasks.iloc[0]["Project"] if not prev_tasks.empty else "-"
+
+                    free_eng_records.append({
+                        "Discipline": disc,
+                        "Engineer": name,
+                        "Last Project": last_proj,
+                        "Upcoming Status": next_info,
+                    })
+
+        if free_eng_records:
+            st.dataframe(pd.DataFrame(free_eng_records), use_container_width=True, hide_index=True)
+        else:
+            st.info("All named engineers in the selected sheets currently have active tasks (check numeric 'Free / Available' above for unlisted team members).")
+
+    # Upcoming tasks notice
+    upcoming_all = work_df[work_df["Status"] == "🔵 Upcoming"].sort_values("Start Date")
+    if not upcoming_all.empty:
+        with st.expander(f"🔵 Upcoming Scheduled Tasks ({len(upcoming_all)})"):
+            st.dataframe(
+                upcoming_all[["Discipline", "Engineers", "Project", "Task", "Engineers Count", "Start Date", "End Date"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Section 3: Daily Availability Forecast (Sun - Thu)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 📈 Daily Free Engineers Forecast (Sunday - Thursday)")
+
+    forecast_weeks = st.slider("Forecast Horizon (Weeks):", 1, 8, 3, key="actual_forecast_weeks")
+    f_days = [
+        d.date()
+        for d in pd.bdate_range(start=ref_date, periods=forecast_weeks * 5, freq="C", weekmask=PD_WEEKMASK)
+    ]
+    f_labels = [d.strftime("%a %d-%b") for d in f_days]
+
+    forecast_table_rows = []
+    forecast_chart_rows = []
+
+    for disc in selected_discs:
+        d_sub = work_df[work_df["Discipline"] == disc]
+        tot_eng = total_engineers_map[disc]
+        row_dict = {"Discipline": disc, "Total": tot_eng}
+
+        for d_obj, d_lbl in zip(f_days, f_labels):
+            active_on_d = d_sub[d_sub.apply(lambda r: is_task_active_on_date(r, d_obj), axis=1)]
+            if calc_basis == "By 'عدد المهندسين' Column":
+                busy_cnt = int(active_on_d["Engineers Count"].sum()) if not active_on_d.empty else 0
+            else:
+                busy_cnt = len({n for lst in active_on_d["Engineer List"] for n in lst})
+            free_cnt = tot_eng - busy_cnt
+            row_dict[d_lbl] = free_cnt
+            forecast_chart_rows.append({
+                "Day": d_lbl,
+                "Discipline": disc,
+                "Free Engineers": free_cnt,
+                "Busy Engineers": busy_cnt,
+            })
+
+        forecast_table_rows.append(row_dict)
+
+    forecast_df = pd.DataFrame(forecast_table_rows)
+
+    def _style_free_cells(val):
+        if isinstance(val, (int, float)):
+            if val < 0:
+                return "background-color: #ffcccc; color: #900000; font-weight: bold"
+            if val > 0:
+                return "background-color: #e6f4ea; color: #137333; font-weight: bold"
+        return ""
+
+    st.caption("Positive (green) = available engineers | Negative (red) = overloaded / multi-tasking")
+    st.dataframe(
+        forecast_df.style.map(_style_free_cells, subset=f_labels),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    f_chart_df = pd.DataFrame(forecast_chart_rows)
+    if not f_chart_df.empty:
+        line_chart = alt.Chart(f_chart_df).mark_line(point=True).encode(
+            x=alt.X("Day:N", sort=f_labels, title="Working Day", axis=alt.Axis(labelAngle=-45)),
+            y=alt.Y("Free Engineers:Q", title="Free / Available Engineers"),
+            color=alt.Color("Discipline:N"),
+            tooltip=["Day", "Discipline", "Busy Engineers", "Free Engineers"],
+        ).properties(height=300)
+        zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q")
+        st.altair_chart(line_chart + zero_rule, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # Section 4: Detailed Tasks & Gantt per Discipline
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 📋 Detailed Task Register & Timeline by Discipline")
+
+    tab_names = ["All Disciplines"] + selected_discs
+    disc_tabs = st.tabs(tab_names)
+
+    for idx, t_name in enumerate(tab_names):
+        with disc_tabs[idx]:
+            sub = work_df if t_name == "All Disciplines" else work_df[work_df["Discipline"] == t_name]
+            if sub.empty:
+                st.info(f"No tasks recorded for {t_name}.")
+                continue
+
+            display_cols = ["Discipline", "Status", "Unit Head", "Engineers", "Project", "Task", "Engineers Count", "Start Date", "End Date", "Days Left"]
+            st.dataframe(sub[display_cols], use_container_width=True, hide_index=True)
+
+            # Mini Gantt for tasks with valid dates
+            g_df = sub[sub["Start Date"].notna()].copy()
+            if not g_df.empty:
+                g_df["Start"] = pd.to_datetime(g_df["Start Date"])
+                # For ongoing tasks with no End Date, visualize up to ref_date + 14 days
+                fallback_end = pd.Timestamp(ref_date + datetime.timedelta(days=14))
+                g_df["End"] = g_df["End Date"].apply(
+                    lambda d: pd.Timestamp(d) if pd.notnull(d) else fallback_end
+                )
+                g_df["EndPlus"] = g_df["End"] + pd.Timedelta(days=1)
+                g_df["Label"] = g_df.apply(
+                    lambda r: f"[{r['Discipline']}] {r['Project']} ({r['Engineers']})"
+                    if t_name == "All Disciplines"
+                    else f"{r['Project']} ({r['Engineers']})",
+                    axis=1,
+                )
+                if g_df["Label"].duplicated().any():
+                    seen = {}
+                    uniq = []
+                    for lbl in g_df["Label"]:
+                        c = seen.get(lbl, 0) + 1
+                        seen[lbl] = c
+                        uniq.append(f"{lbl} #{c}" if c > 1 else lbl)
+                    g_df["Label"] = uniq
+
+                g_df = g_df.sort_values(["Start", "End"])
+                g_order = g_df["Label"].tolist()
+
+                bars = alt.Chart(g_df).mark_bar(cornerRadius=3).encode(
+                    y=alt.Y("Label:N", sort=g_order, title=None, axis=alt.Axis(labelLimit=320)),
+                    x=alt.X("Start:T", title="Timeline", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
+                    x2="EndPlus:T",
+                    color=alt.Color("Status:N"),
+                    tooltip=[
+                        alt.Tooltip("Discipline:N"),
+                        alt.Tooltip("Project:N"),
+                        alt.Tooltip("Engineers:N"),
+                        alt.Tooltip("Task:N"),
+                        alt.Tooltip("Engineers Count:Q"),
+                        alt.Tooltip("Start:T", format="%d-%b-%Y"),
+                        alt.Tooltip("End:T", format="%d-%b-%Y"),
+                        alt.Tooltip("Status:N"),
+                    ],
+                )
+                ref_rule = alt.Chart(pd.DataFrame({"Ref": [pd.Timestamp(ref_date)]})).mark_rule(
+                    color="red", strokeDash=[5, 4], strokeWidth=2
+                ).encode(x="Ref:T")
+
+                st.altair_chart(
+                    (bars + ref_rule).properties(height=max(160, 32 * len(g_df) + 50)),
+                    use_container_width=True,
+                )
 
 
 # ----------------------------------------------------------------------
@@ -758,11 +1390,17 @@ def render_main_overview():
 # Team selection
 # ----------------------------------------------------------------------
 selected_team = st.radio(
-    "👥 Select View / Team:", [MAIN_OPTION] + list(TEAMS.keys()), horizontal=True
+    "👥 Select View / Team:",
+    [MAIN_OPTION] + list(TEAMS.keys()) + [ACTUAL_TEAM_OPTION],
+    horizontal=True,
 )
 
 if selected_team == MAIN_OPTION:
     render_main_overview()
+    st.stop()
+
+if selected_team == ACTUAL_TEAM_OPTION:
+    render_actual_team_view()
     st.stop()
 
 team_cfg = TEAMS[selected_team]
