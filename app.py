@@ -844,7 +844,7 @@ def render_actual_team_view():
             upcoming_sub = d_sub[d_sub["Status"] == "🔵 Upcoming"]
             completed_sub = d_sub[d_sub["Status"] == "⚪ Completed"]
 
-for name in all_known_names:
+            for name in all_known_names:
                 if name not in active_names:
                     # Check if they have an upcoming task
                     if not upcoming_sub.empty:
@@ -868,13 +868,6 @@ for name in all_known_names:
 
                     last_proj = prev_tasks.iloc[0]["Project"] if not prev_tasks.empty else "-"
 
-                    free_eng_records.append({
-                        "Discipline": disc,
-                        "Engineer": name,
-                        "Last Project": last_proj,
-                        "Upcoming Status": next_info,
-                    })
-            
                     free_eng_records.append({
                         "Discipline": disc,
                         "Engineer": name,
