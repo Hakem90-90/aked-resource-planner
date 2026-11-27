@@ -844,10 +844,15 @@ def render_actual_team_view():
             upcoming_sub = d_sub[d_sub["Status"] == "🔵 Upcoming"]
             completed_sub = d_sub[d_sub["Status"] == "⚪ Completed"]
 
-            for name in all_known_names:
+for name in all_known_names:
                 if name not in active_names:
                     # Check if they have an upcoming task
-                    next_tasks = upcoming_sub[upcoming_sub["Engineer List"].apply(lambda lst: name in lst)].sort_values("Start Date")
+                    if not upcoming_sub.empty:
+                        next_mask = upcoming_sub["Engineer List"].apply(lambda lst: name in lst).astype(bool)
+                        next_tasks = upcoming_sub[next_mask].sort_values("Start Date")
+                    else:
+                        next_tasks = pd.DataFrame()
+
                     if not next_tasks.empty:
                         nxt = next_tasks.iloc[0]
                         next_info = f"Booked: {nxt['Project']} (starts {nxt['Start Date']})"
@@ -855,9 +860,21 @@ def render_actual_team_view():
                         next_info = "No upcoming task scheduled"
 
                     # Last completed task
-                    prev_tasks = completed_sub[completed_sub["Engineer List"].apply(lambda lst: name in lst)].sort_values("End Date", ascending=False)
+                    if not completed_sub.empty:
+                        prev_mask = completed_sub["Engineer List"].apply(lambda lst: name in lst).astype(bool)
+                        prev_tasks = completed_sub[prev_mask].sort_values("End Date", ascending=False)
+                    else:
+                        prev_tasks = pd.DataFrame()
+
                     last_proj = prev_tasks.iloc[0]["Project"] if not prev_tasks.empty else "-"
 
+                    free_eng_records.append({
+                        "Discipline": disc,
+                        "Engineer": name,
+                        "Last Project": last_proj,
+                        "Upcoming Status": next_info,
+                    })
+            
                     free_eng_records.append({
                         "Discipline": disc,
                         "Engineer": name,
